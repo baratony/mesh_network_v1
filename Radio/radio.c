@@ -287,6 +287,13 @@ bool Respond_To_Connections_Request(uint32_t global_address,
     return radio_send_packet(radio, &response, e32_destination, 0);
 }
 
+bool Respond_To_Local_Address(uint32_t global_address,
+                              e32_t *radio,
+                              ftp_client_t *ftp,
+                              const radio_packet_t *request);
+
+
+                              
 bool Handle_Radio_Packet(uint32_t global_address,
                          e32_t *radio,
                          ftp_client_t *ftp,
