@@ -17,6 +17,13 @@
 #define RADIO_CONNECTION_RECORD_SIZE 6
 #define RADIO_CONNECTIONS_PER_PACKET 8
 #define RADIO_CONNECTION_RESPONSE_TIMEOUT_MS 5000
+#define RADIO_GLOBAL_CONNECTIONS_FILE "global_connections.bin"
+#define RADIO_GLOBAL_CONNECTIONS_ROW_SIZE (9u * sizeof(uint32_t))
+#define RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE 4096
+#define RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE 8
+#define RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE \
+    (RADIO_MAX_DATA - RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE)
+#define RADIO_GLOBAL_CONNECTIONS_RESPONSE_TIMEOUT_MS 10000
 
 
 typedef struct
@@ -29,6 +36,9 @@ typedef struct
 static uint8_t neighbor_file[RADIO_NEIGHBOR_FILE_MAX_SIZE + 1];
 static size_t neighbor_file_length;
 static bool neighbor_file_overflow;
+static uint8_t global_connections_file[RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE];
+static size_t global_connections_file_length;
+static bool global_connections_file_overflow;
 
 
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
@@ -44,6 +54,33 @@ static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
     memcpy(&neighbor_file[neighbor_file_length], data, length);
     neighbor_file_length += length;
     neighbor_file[neighbor_file_length] = '\0';
+}
+
+
+static void radio_global_connections_file_cb(uint8_t *data, uint16_t length)
+{
+    size_t available = sizeof(global_connections_file) -
+                       global_connections_file_length;
+
+    if (length > available)
+    {
+        length = (uint16_t)available;
+        global_connections_file_overflow = true;
+    }
+
+    memcpy(&global_connections_file[global_connections_file_length],
+           data,
+           length);
+    global_connections_file_length += length;
+}
+
+
+static uint32_t radio_read_u32_be(const uint8_t *data)
+{
+    return ((uint32_t)data[0] << 24) |
+           ((uint32_t)data[1] << 16) |
+           ((uint32_t)data[2] << 8) |
+           (uint32_t)data[3];
 }
 
 
@@ -92,6 +129,47 @@ static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
 
     *neighbor_count = count;
     return count > 0;
+}
+
+
+static bool radio_find_oldest_neighbor(uint32_t global_address,
+                                       radio_neighbor_t *oldest,
+                                       ftp_client_t *ftp)
+{
+    if (ftp == NULL || oldest == NULL)
+        return false;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    bool found = false;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == global_address)
+            continue;
+
+        if (!found || neighbors[i].global_address < oldest->global_address)
+        {
+            *oldest = neighbors[i];
+            found = true;
+        }
+    }
+
+    return found;
 }
 
 
@@ -287,6 +365,199 @@ bool Respond_To_Connections_Request(uint32_t global_address,
     return radio_send_packet(radio, &response, e32_destination, 0);
 }
 
+
+bool Request_Global_Connections(uint32_t global_address,
+                                e32_t *radio,
+                                ftp_client_t *ftp)
+{
+    if (radio == NULL || ftp == NULL)
+        return false;
+
+    radio_neighbor_t oldest;
+    if (!radio_find_oldest_neighbor(global_address, &oldest, ftp))
+    {
+        printf("No older neighbor found\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    ++sequence;
+
+    radio_packet_t request;
+    if (!radio_packet_create(&request,
+                             global_address,
+                             oldest.global_address,
+                             RADIO_CMD_RECEIVE_GLOBAL_CONNECTIONS,
+                             RADIO_FLAG_ACK_REQUEST,
+                             sequence) ||
+        !radio_send_packet(radio, &request, oldest.local_address, 0))
+    {
+        printf("Failed to request global connections from %08lX\n",
+               (unsigned long)oldest.global_address);
+        return false;
+    }
+
+    global_connections_file_length = 0;
+    absolute_time_t timeout = make_timeout_time_ms(
+        RADIO_GLOBAL_CONNECTIONS_RESPONSE_TIMEOUT_MS);
+    uint32_t expected_length = 0;
+
+    while (!time_reached(timeout))
+    {
+        radio_packet_t response;
+        if (radio_receive_packet(radio, &response) &&
+            response.command == RADIO_CMD_SEND_GLOBAL_CONNECTIONS &&
+            response.destination == global_address &&
+            response.source == oldest.global_address &&
+            response.sequence >= sequence &&
+            response.length >= RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE)
+        {
+            uint32_t total_length = radio_read_u32_be(response.data);
+            uint32_t offset = radio_read_u32_be(&response.data[4]);
+            uint16_t chunk_length = (uint16_t)(response.length -
+                                               RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE);
+
+            if (total_length <= sizeof(global_connections_file) &&
+                total_length % RADIO_GLOBAL_CONNECTIONS_ROW_SIZE == 0 &&
+                offset == global_connections_file_length &&
+                chunk_length <= RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE &&
+                offset + chunk_length <= total_length)
+            {
+                if (expected_length == 0)
+                    expected_length = total_length;
+
+                if (total_length == expected_length)
+                {
+                    memcpy(&global_connections_file[offset],
+                           &response.data[RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE],
+                           chunk_length);
+                    global_connections_file_length += chunk_length;
+
+                    if (global_connections_file_length == expected_length)
+                        break;
+                }
+            }
+        }
+
+        sleep_ms(1);
+    }
+
+    if (expected_length == 0 ||
+        global_connections_file_length != expected_length)
+    {
+        printf("Global connections response timed out or was invalid\n");
+        return false;
+    }
+
+    if (!ftp_upload(ftp,
+                    RADIO_GLOBAL_CONNECTIONS_FILE,
+                    global_connections_file,
+                    (uint32_t)global_connections_file_length))
+    {
+        printf("FTP upload failed\n");
+        ftp_disconnect(ftp);
+        return false;
+    }
+
+    return true;
+}
+
+
+bool Respond_To_Global_Connections_Request(uint32_t global_address,
+                                           e32_t *radio,
+                                           ftp_client_t *ftp,
+                                           const radio_packet_t *request)
+{
+    if (radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_RECEIVE_GLOBAL_CONNECTIONS)
+        return false;
+
+    global_connections_file_length = 0;
+    global_connections_file_overflow = false;
+    if (!ftp_download(ftp,
+                      RADIO_GLOBAL_CONNECTIONS_FILE,
+                      radio_global_connections_file_cb) ||
+        global_connections_file_overflow ||
+        global_connections_file_length == 0 ||
+        global_connections_file_length % RADIO_GLOBAL_CONNECTIONS_ROW_SIZE != 0)
+    {
+        printf("FTP %s download failed or has an invalid format\n",
+               RADIO_GLOBAL_CONNECTIONS_FILE);
+        return false;
+    }
+
+    uint16_t e32_destination = 0;
+    bool requester_found = false;
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    {
+        radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+        uint8_t neighbor_count = 0;
+        if (radio_parse_neighbor_file(neighbors, &neighbor_count))
+        {
+            for (uint8_t i = 0; i < neighbor_count; ++i)
+            {
+                if (neighbors[i].global_address == request->source)
+                {
+                    e32_destination = neighbors[i].local_address;
+                    requester_found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!requester_found)
+    {
+        printf("Requester is not present in local_neighbors.txt\n");
+        return false;
+    }
+
+    uint16_t chunk_sequence = request->sequence;
+    for (uint32_t offset = 0;
+         offset < global_connections_file_length;
+         offset += RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE)
+    {
+        uint32_t remaining = (uint32_t)global_connections_file_length - offset;
+        uint16_t chunk_length = (uint16_t)(remaining >
+                                           RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE
+                                               ? RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE
+                                               : remaining);
+        uint8_t response_data[RADIO_MAX_DATA];
+        radio_write_u32_be(response_data, (uint32_t)global_connections_file_length);
+        radio_write_u32_be(&response_data[4], offset);
+        memcpy(&response_data[RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE],
+               &global_connections_file[offset],
+               chunk_length);
+
+        radio_packet_t response;
+        if (!radio_packet_create(&response,
+                                 global_address,
+                                 request->source,
+                                 RADIO_CMD_SEND_GLOBAL_CONNECTIONS,
+                                 0,
+                                 chunk_sequence++) ||
+            !radio_packet_set_data(&response,
+                                   response_data,
+                                   (uint16_t)(RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE +
+                                              chunk_length)) ||
+            !radio_send_packet(radio, &response, e32_destination, 0))
+        {
+            printf("Failed to send global connections chunk\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool Respond_To_Local_Address(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -316,6 +587,14 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                         radio,
                                         ftp,
                                         packet);
+    }
+
+    if (packet->command == RADIO_CMD_RECEIVE_GLOBAL_CONNECTIONS)
+    {
+        return Respond_To_Global_Connections_Request(global_address,
+                                                     radio,
+                                                     ftp,
+                                                     packet);
     }
 
     return false;
@@ -651,7 +930,5 @@ upload_neighbors:
                           (uint32_t)output_length);
     }
 }
-
-printf("Hello Test");
 
 e32_t radio;
