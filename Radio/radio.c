@@ -652,5 +652,6 @@ upload_neighbors:
     }
 }
 
+printf("Hello Test");
 
 e32_t radio;
