@@ -24,6 +24,10 @@
 #define RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE \
     (RADIO_MAX_DATA - RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE)
 #define RADIO_GLOBAL_CONNECTIONS_RESPONSE_TIMEOUT_MS 10000
+#define RADIO_GLOBAL_ROUTE_MAX_JUMPS 14
+#define RADIO_GLOBAL_ROUTE_MAX_ADDRESSES 16
+#define RADIO_GLOBAL_CONNECTIONS_MAX_NODES \
+    (RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE / sizeof(uint32_t))
 
 
 typedef struct
@@ -555,6 +559,181 @@ bool Respond_To_Global_Connections_Request(uint32_t global_address,
         }
     }
 
+    return true;
+}
+
+
+bool Find_Shortest_Global_Route(uint32_t source,
+                                uint32_t destination,
+                                ftp_client_t *ftp,
+                                uint32_t *path,
+                                uint8_t *path_length)
+{
+    if (ftp == NULL || path == NULL || path_length == NULL)
+        return false;
+
+    *path_length = 0;
+
+    global_connections_file_length = 0;
+    global_connections_file_overflow = false;
+    if (!ftp_download(ftp,
+                      RADIO_GLOBAL_CONNECTIONS_FILE,
+                      radio_global_connections_file_cb) ||
+        global_connections_file_overflow ||
+        global_connections_file_length == 0 ||
+        global_connections_file_length % RADIO_GLOBAL_CONNECTIONS_ROW_SIZE != 0)
+    {
+        printf("FTP %s download failed or has an invalid format\n",
+               RADIO_GLOBAL_CONNECTIONS_FILE);
+        return false;
+    }
+
+    if (source == destination)
+    {
+        path[0] = source;
+        *path_length = 1;
+        return true;
+    }
+
+    uint32_t nodes[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
+    int16_t parent[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
+    uint8_t depth[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
+    uint16_t queue[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
+    size_t node_count = 0;
+    size_t row_count = global_connections_file_length /
+                       RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+
+    for (size_t row = 0; row < row_count; ++row)
+    {
+        for (uint8_t column = 0; column < 9; ++column)
+        {
+            uint32_t address;
+            memcpy(&address,
+                   &global_connections_file[row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE +
+                                            column * sizeof(uint32_t)],
+                   sizeof(address));
+
+            if (address == 0)
+                continue;
+
+            bool already_present = false;
+            for (size_t i = 0; i < node_count; ++i)
+            {
+                if (nodes[i] == address)
+                {
+                    already_present = true;
+                    break;
+                }
+            }
+
+            if (!already_present && node_count < RADIO_GLOBAL_CONNECTIONS_MAX_NODES)
+            {
+                nodes[node_count] = address;
+                parent[node_count] = -1;
+                depth[node_count] = 0;
+                ++node_count;
+            }
+        }
+    }
+
+    size_t source_index = node_count;
+    size_t destination_index = node_count;
+    for (size_t i = 0; i < node_count; ++i)
+    {
+        if (nodes[i] == source)
+            source_index = i;
+        if (nodes[i] == destination)
+            destination_index = i;
+    }
+
+    if (source_index == node_count || destination_index == node_count)
+    {
+        printf("It is not possible to connect to %08lX\n",
+               (unsigned long)destination);
+        return false;
+    }
+
+    size_t queue_head = 0;
+    size_t queue_tail = 0;
+    queue[queue_tail++] = (uint16_t)source_index;
+    parent[source_index] = -2;
+
+    while (queue_head < queue_tail && parent[destination_index] == -1)
+    {
+        size_t current_index = queue[queue_head++];
+        if (depth[current_index] >= RADIO_GLOBAL_ROUTE_MAX_JUMPS)
+            continue;
+
+        size_t row = row_count;
+        for (size_t candidate_row = 0; candidate_row < row_count; ++candidate_row)
+        {
+            uint32_t row_node;
+            memcpy(&row_node,
+                   &global_connections_file[candidate_row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE],
+                   sizeof(row_node));
+            if (row_node == nodes[current_index])
+            {
+                row = candidate_row;
+                break;
+            }
+        }
+
+        if (row == row_count)
+            continue;
+
+        for (uint8_t column = 1; column < 9; ++column)
+        {
+            uint32_t neighbor;
+            memcpy(&neighbor,
+                   &global_connections_file[row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE +
+                                            column * sizeof(uint32_t)],
+                   sizeof(neighbor));
+            if (neighbor == 0)
+                continue;
+
+            size_t neighbor_index = node_count;
+            for (size_t i = 0; i < node_count; ++i)
+            {
+                if (nodes[i] == neighbor)
+                {
+                    neighbor_index = i;
+                    break;
+                }
+            }
+
+            if (neighbor_index == node_count || parent[neighbor_index] != -1)
+                continue;
+
+            parent[neighbor_index] = (int16_t)current_index;
+            depth[neighbor_index] = (uint8_t)(depth[current_index] + 1);
+            queue[queue_tail++] = (uint16_t)neighbor_index;
+        }
+    }
+
+    if (parent[destination_index] == -1)
+    {
+        printf("It is not possible to connect to %08lX within %u jumps\n",
+               (unsigned long)destination,
+               RADIO_GLOBAL_ROUTE_MAX_JUMPS);
+        return false;
+    }
+
+    uint16_t reverse_path[RADIO_GLOBAL_ROUTE_MAX_ADDRESSES];
+    uint8_t reverse_length = 0;
+    for (int16_t current = (int16_t)destination_index;
+         current != -2 && reverse_length < RADIO_GLOBAL_ROUTE_MAX_ADDRESSES;
+         current = parent[current])
+    {
+        reverse_path[reverse_length++] = (uint16_t)current;
+    }
+
+    if (reverse_length == 0 || reverse_length > RADIO_GLOBAL_ROUTE_MAX_ADDRESSES)
+        return false;
+
+    for (uint8_t i = 0; i < reverse_length; ++i)
+        path[i] = nodes[reverse_path[reverse_length - i - 1]];
+
+    *path_length = reverse_length;
     return true;
 }
 
