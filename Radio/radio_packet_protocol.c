@@ -234,6 +234,10 @@ bool radio_packet_create(radio_packet_t *packet,
 
     packet->source = source;
     packet->destination = destination;
+    packet->path[0] = source;
+    packet->path_length = source == destination ? 1 : 2;
+    if (packet->path_length == 2)
+        packet->path[1] = destination;
     packet->command = command;
     packet->flags = flags;
     packet->sequence = sequence;
@@ -264,6 +268,27 @@ bool radio_packet_set_data(radio_packet_t *packet,
     return true;
 }
 
+bool radio_packet_set_path(radio_packet_t *packet,
+                           const uint32_t *path,
+                           uint8_t path_length)
+{
+    if (packet == NULL || path == NULL ||
+        path_length == 0 || path_length > RADIO_MAX_ROUTE_ADDRESSES)
+        return false;
+
+    memcpy(packet->path, path, (size_t)path_length * sizeof(uint32_t));
+    packet->path_length = path_length;
+    packet->source = path[0];
+    packet->destination = path[path_length - 1];
+
+    if (packet->destination == RADIO_BROADCAST_ADDRESS)
+        packet->flags |= RADIO_FLAG_BROADCAST;
+    else
+        packet->flags &= (uint8_t)~RADIO_FLAG_BROADCAST;
+
+    return true;
+}
+
 /* --------------------------------------------------------------------------
  * Encoding
  * -------------------------------------------------------------------------- */
@@ -275,41 +300,47 @@ uint16_t radio_packet_encode(radio_packet_t *packet,
     if (packet == NULL || buffer == NULL)
         return 0;
 
-    if (packet->length > RADIO_MAX_DATA)
+    if (packet->length > RADIO_MAX_DATA ||
+        packet->path_length == 0 ||
+        packet->path_length > RADIO_MAX_ROUTE_ADDRESSES)
         return 0;
 
     /* Keep broadcast flag synchronized before CRC is calculated. */
     if (packet->destination == RADIO_BROADCAST_ADDRESS)
         packet->flags |= RADIO_FLAG_BROADCAST;
 
-    uint16_t total_length = RADIO_PACKET_OVERHEAD + packet->length;
+    uint16_t header_size = RADIO_PACKET_FIXED_HEADER_SIZE +
+                           (uint16_t)(packet->path_length * sizeof(uint32_t));
+    uint16_t total_length = header_size + RADIO_PACKET_CRC_SIZE +
+                            packet->length;
 
     if (buffer_size < total_length)
         return 0;
 
     buffer[0] = RADIO_PACKET_START;
+    buffer[1] = (uint8_t)(packet->path_length - 1u);
 
-    write_u32_be(&buffer[1], packet->destination);
-    write_u32_be(&buffer[5], packet->source);
+    for (uint8_t i = 0; i < packet->path_length; ++i)
+        write_u32_be(&buffer[2u + (i * sizeof(uint32_t))], packet->path[i]);
 
-    write_u16_be(&buffer[9], packet->command);
-    buffer[11] = packet->flags;
+    write_u16_be(&buffer[header_size - 7], packet->command);
+    buffer[header_size - 5] = packet->flags;
 
-    write_u16_be(&buffer[12], packet->sequence);
-    write_u16_be(&buffer[14], packet->length);
+    write_u16_be(&buffer[header_size - 4], packet->sequence);
+    write_u16_be(&buffer[header_size - 2], packet->length);
 
     if (packet->length > 0)
     {
-        memcpy(&buffer[RADIO_PACKET_HEADER_SIZE],
+        memcpy(&buffer[header_size],
                packet->data,
                packet->length);
     }
 
     packet->crc = radio_crc16(
         buffer,
-        RADIO_PACKET_HEADER_SIZE + packet->length);
+        header_size + packet->length);
 
-    write_u16_be(&buffer[RADIO_PACKET_HEADER_SIZE + packet->length],
+    write_u16_be(&buffer[header_size + packet->length],
                  packet->crc);
 
     return total_length;
@@ -326,45 +357,60 @@ bool radio_packet_decode(const uint8_t *buffer,
     if (buffer == NULL || packet == NULL)
         return false;
 
-    if (buffer_length < RADIO_PACKET_OVERHEAD)
+    if (buffer_length < RADIO_PACKET_FIXED_HEADER_SIZE +
+                       sizeof(uint32_t) + RADIO_PACKET_CRC_SIZE)
         return false;
 
     if (buffer[0] != RADIO_PACKET_START)
         return false;
 
-    uint16_t data_length = read_u16_be(&buffer[14]);
+    uint8_t route_jumps = buffer[1];
+    uint16_t path_length = (uint16_t)route_jumps + 1u;
+    if (path_length > RADIO_MAX_ROUTE_ADDRESSES)
+        return false;
+
+    uint16_t header_size = RADIO_PACKET_FIXED_HEADER_SIZE +
+                           (uint16_t)(path_length * sizeof(uint32_t));
+    if (buffer_length < header_size + RADIO_PACKET_CRC_SIZE)
+        return false;
+
+    uint16_t data_length = read_u16_be(&buffer[header_size - 2]);
 
     if (data_length > RADIO_MAX_DATA)
         return false;
 
-    uint16_t expected_length = RADIO_PACKET_OVERHEAD + data_length;
+    uint16_t expected_length = header_size + RADIO_PACKET_CRC_SIZE +
+                               data_length;
 
     if (buffer_length != expected_length)
         return false;
 
     uint16_t received_crc =
-        read_u16_be(&buffer[RADIO_PACKET_HEADER_SIZE + data_length]);
+        read_u16_be(&buffer[header_size + data_length]);
 
     uint16_t calculated_crc = radio_crc16(
         buffer,
-        RADIO_PACKET_HEADER_SIZE + data_length);
+        header_size + data_length);
 
     if (received_crc != calculated_crc)
         return false;
 
     memset(packet, 0, sizeof(*packet));
 
-    packet->destination = read_u32_be(&buffer[1]);
-    packet->source = read_u32_be(&buffer[5]);
-    packet->command = read_u16_be(&buffer[9]);
-    packet->flags = buffer[11];
-    packet->sequence = read_u16_be(&buffer[12]);
+    packet->path_length = (uint8_t)path_length;
+    for (uint8_t i = 0; i < packet->path_length; ++i)
+        packet->path[i] = read_u32_be(&buffer[2u + (i * sizeof(uint32_t))]);
+    packet->source = packet->path[0];
+    packet->destination = packet->path[packet->path_length - 1];
+    packet->command = read_u16_be(&buffer[header_size - 7]);
+    packet->flags = buffer[header_size - 5];
+    packet->sequence = read_u16_be(&buffer[header_size - 4]);
     packet->length = data_length;
 
     if (data_length > 0)
     {
         memcpy(packet->data,
-               &buffer[RADIO_PACKET_HEADER_SIZE],
+             &buffer[header_size],
                data_length);
     }
 
@@ -471,10 +517,29 @@ bool radio_receive_packet(e32_t *dev,
 
         state->buffer[state->position++] = byte;
 
-        /* After the 16-byte header, length is available at bytes 14-15. */
-        if (state->position == RADIO_PACKET_HEADER_SIZE)
+        /* The jump count determines where the rest of the header ends. */
+        if (state->position == 2)
         {
-            uint16_t data_length = read_u16_be(&state->buffer[14]);
+            uint8_t route_jumps = state->buffer[1];
+            uint16_t path_length = (uint16_t)route_jumps + 1u;
+            if (path_length > RADIO_MAX_ROUTE_ADDRESSES)
+            {
+                state->position = 0;
+                state->expected_length = 0;
+                state->active = false;
+                continue;
+            }
+
+            state->expected_length = RADIO_PACKET_FIXED_HEADER_SIZE +
+                                     (uint16_t)(path_length * sizeof(uint32_t));
+        }
+
+        if (state->expected_length != 0 &&
+            state->position == state->expected_length)
+        {
+            uint16_t header_size = state->expected_length;
+            uint16_t data_length = read_u16_be(
+                &state->buffer[header_size - 2]);
 
             if (data_length > RADIO_MAX_DATA)
             {
@@ -484,17 +549,16 @@ bool radio_receive_packet(e32_t *dev,
                 continue;
             }
 
-            state->expected_length =
-                RADIO_PACKET_OVERHEAD + data_length;
+            state->expected_length = header_size + RADIO_PACKET_CRC_SIZE +
+                                     data_length;
         }
 
-        if (state->expected_length != 0 &&
+        if (state->expected_length > 0 &&
             state->position == state->expected_length)
         {
-            bool valid = radio_packet_decode(
-                state->buffer,
-                state->expected_length,
-                packet);
+            bool valid = radio_packet_decode(state->buffer,
+                                              state->expected_length,
+                                              packet);
 
             state->position = 0;
             state->expected_length = 0;

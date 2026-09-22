@@ -29,24 +29,29 @@
  * Packet format on the wire:
  *
  *   Byte 0       : START (0xAA)
- *   Bytes 1-4    : Destination global address, big-endian
- *   Bytes 5-8    : Source global address, big-endian
- *   Bytes 9-10   : Command, big-endian
- *   Byte 11      : Flags
- *   Bytes 12-13  : Sequence number, big-endian
- *   Bytes 14-15  : Data length, big-endian
- *   Bytes 16..   : Data
+ *   Byte 1       : Number of jumps in the route
+ *   Bytes 2..    : Route addresses, big-endian; one source address plus
+ *                  one address for each jump
+ *   Next 2       : Command, big-endian
+ *   Next 1       : Flags
+ *   Next 2       : Sequence number, big-endian
+ *   Next 2       : Data length, big-endian
+ *   Next bytes   : Data
  *   Final 2      : CRC-16-CCITT, big-endian
  */
 #define RADIO_PACKET_START       0xAA
-#define RADIO_PACKET_HEADER_SIZE 16
+#define RADIO_MAX_ROUTE_ADDRESSES 16
+#define RADIO_MAX_ROUTE_JUMPS    (RADIO_MAX_ROUTE_ADDRESSES - 1)
+#define RADIO_PACKET_FIXED_HEADER_SIZE 9
 #define RADIO_PACKET_CRC_SIZE    2
-#define RADIO_PACKET_OVERHEAD    (RADIO_PACKET_HEADER_SIZE + RADIO_PACKET_CRC_SIZE)
+#define RADIO_MAX_DATA           256
+#define RADIO_PACKET_MAX_HEADER_SIZE \
+    (RADIO_PACKET_FIXED_HEADER_SIZE + \
+     (RADIO_MAX_ROUTE_ADDRESSES * sizeof(uint32_t)))
+#define RADIO_MAX_PACKET_SIZE \
+    (RADIO_PACKET_MAX_HEADER_SIZE + RADIO_MAX_DATA + RADIO_PACKET_CRC_SIZE)
 
 /* e32_send_fixed() currently has a 512-byte temporary buffer. */
-#define RADIO_MAX_DATA        256
-#define RADIO_MAX_PACKET_SIZE (RADIO_PACKET_OVERHEAD + RADIO_MAX_DATA)
-
 /* Commands */
 typedef enum
 {
@@ -73,6 +78,10 @@ typedef enum
 
 typedef struct
 {
+    uint32_t path[RADIO_MAX_ROUTE_ADDRESSES];
+    uint8_t path_length;
+
+    /* Compatibility aliases for the first and last path addresses. */
     uint32_t destination;
     uint32_t source;
 
@@ -133,6 +142,12 @@ bool radio_packet_set_data(
     radio_packet_t *packet,
     const uint8_t *data,
     uint16_t length
+);
+
+bool radio_packet_set_path(
+    radio_packet_t *packet,
+    const uint32_t *path,
+    uint8_t path_length
 );
 
 uint16_t radio_crc16(
