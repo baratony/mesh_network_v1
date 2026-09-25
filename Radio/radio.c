@@ -88,6 +88,102 @@ static uint32_t radio_read_u32_be(const uint8_t *data)
 }
 
 
+static uint32_t radio_read_global_connection_word(size_t offset)
+{
+    uint32_t value;
+    memcpy(&value, &global_connections_file[offset], sizeof(value));
+    return value;
+}
+
+
+static void radio_write_global_connection_word(size_t offset, uint32_t value)
+{
+    memcpy(&global_connections_file[offset], &value, sizeof(value));
+}
+
+
+static bool radio_download_global_connections(ftp_client_t *ftp)
+{
+    global_connections_file_length = 0;
+    global_connections_file_overflow = false;
+
+    if (ftp == NULL ||
+        !ftp_download(ftp, RADIO_GLOBAL_CONNECTIONS_FILE,
+                      radio_global_connections_file_cb))
+        return false;
+
+    return !global_connections_file_overflow &&
+           global_connections_file_length % RADIO_GLOBAL_CONNECTIONS_ROW_SIZE == 0;
+}
+
+
+static bool radio_global_connection_saved(uint32_t global_address)
+{
+    for (size_t offset = 0;
+         offset < global_connections_file_length;
+         offset += sizeof(uint32_t))
+    {
+        if (radio_read_global_connection_word(offset) == global_address)
+            return true;
+    }
+
+    return false;
+}
+
+
+static bool radio_add_global_connection(uint32_t local_global_address,
+                                        uint32_t new_global_address)
+{
+    if (radio_global_connection_saved(new_global_address))
+        return false;
+
+    size_t row_count = global_connections_file_length /
+                       RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    size_t local_row = row_count;
+
+    for (size_t row = 0; row < row_count; ++row)
+    {
+        if (radio_read_global_connection_word(row *
+                                              RADIO_GLOBAL_CONNECTIONS_ROW_SIZE) ==
+            local_global_address)
+        {
+            local_row = row;
+            break;
+        }
+    }
+
+    if (local_row == row_count)
+    {
+        if (global_connections_file_length + RADIO_GLOBAL_CONNECTIONS_ROW_SIZE >
+            sizeof(global_connections_file))
+            return false;
+
+        size_t row_offset = global_connections_file_length;
+        memset(&global_connections_file[row_offset],
+               0,
+               RADIO_GLOBAL_CONNECTIONS_ROW_SIZE);
+        radio_write_global_connection_word(row_offset, local_global_address);
+        radio_write_global_connection_word(row_offset + sizeof(uint32_t),
+                                           new_global_address);
+        global_connections_file_length += RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+        return true;
+    }
+
+    size_t row_offset = local_row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    for (uint8_t column = 1; column < 9; ++column)
+    {
+        size_t offset = row_offset + column * sizeof(uint32_t);
+        if (radio_read_global_connection_word(offset) == 0)
+        {
+            radio_write_global_connection_word(offset, new_global_address);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
 static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
                                       uint8_t *neighbor_count)
 {
@@ -737,6 +833,137 @@ bool Find_Shortest_Global_Route(uint32_t source,
     return true;
 }
 
+
+bool Relay_New_Node(uint32_t global_address,
+                    e32_t *radio,
+                    ftp_client_t *ftp)
+{
+    if (radio == NULL || ftp == NULL || global_address == 0)
+        return false;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        radio_packet_t packet;
+        if (!radio_packet_create(&packet,
+                                 global_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_RELAY_NEW_NODE,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 ++sequence) ||
+            !radio_send_packet(radio, &packet, neighbors[i].local_address, 0))
+        {
+            printf("Failed to announce new node to %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    return sent;
+}
+
+
+bool Respond_To_New_Node(uint32_t global_address,
+                         e32_t *radio,
+                         ftp_client_t *ftp,
+                         const radio_packet_t *request)
+{
+    if (radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_RELAY_NEW_NODE ||
+        request->source == 0)
+        return false;
+
+    uint32_t new_global_address = request->source;
+
+    /* The origin already knows its own address; do not bounce the packet. */
+    if (new_global_address == global_address)
+        return true;
+
+    if (!radio_download_global_connections(ftp))
+    {
+        printf("FTP %s download failed or has an invalid format\n",
+               RADIO_GLOBAL_CONNECTIONS_FILE);
+        return false;
+    }
+
+    /* Duplicate announcements stop here, which prevents relay loops. */
+    if (radio_global_connection_saved(new_global_address))
+        return true;
+
+    if (!radio_add_global_connection(global_address, new_global_address))
+    {
+        printf("Could not add %08lX to the global connection file\n",
+               (unsigned long)new_global_address);
+        return false;
+    }
+
+    if (!ftp_upload(ftp,
+                    RADIO_GLOBAL_CONNECTIONS_FILE,
+                    global_connections_file,
+                    (uint32_t)global_connections_file_length))
+    {
+        printf("FTP upload failed\n");
+        ftp_disconnect(ftp);
+        return false;
+    }
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        radio_packet_t packet;
+        if (!radio_packet_create(&packet,
+                                 new_global_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_RELAY_NEW_NODE,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 ++sequence) ||
+            !radio_send_packet(radio, &packet, neighbors[i].local_address, 0))
+        {
+            printf("Failed to relay new node to %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    return sent;
+}
+
 bool Respond_To_Local_Address(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -774,6 +1001,14 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                                      radio,
                                                      ftp,
                                                      packet);
+    }
+
+    if (packet->command == RADIO_CMD_RELAY_NEW_NODE)
+    {
+        return Respond_To_New_Node(global_address,
+                                   radio,
+                                   ftp,
+                                   packet);
     }
 
     return false;
