@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include "Cryptographic_Functions.h"
 #include "pico/stdlib.h"
 #include "mini-gmp.h"
 #include "hardware/structs/rosc.h"
@@ -10,6 +11,7 @@
 #include "hardware/vreg.h"
 #include "chacha20_drng.h"
 #include "mbedtls/sha256.h"
+#include "mbedtls/chachapoly.h"
 
 // ======================================================
 // ROSC setup
@@ -41,8 +43,6 @@ void rosc_setup(void) {
     *rosc_freqB =
         (ROSC_FREQB_PASSWD_VALUE_PASS << 16) | 0xFFFF;
 };
-
-
 // ======================================================
 // Generate list of random numbers
 //
@@ -210,7 +210,6 @@ bool RSA_safe_prime_check(mpz_t prime_one, mpz_t prime_two) {
     printf("Safe Check Completed\n");
     return result;
 };
-
 void RSA_encrypt(mpz_t Message, mpz_t EKey, mpz_t Public_Modulo, mpz_t Cipher_Text) {
 
 //    C = M^E mod(N)
@@ -485,7 +484,6 @@ int chacha20poly1305_encrypt(
 
     return result;
 };
-
 int chacha20poly1305_decrypt(
     const uint8_t key[32],
     const uint8_t nonce[12],
@@ -521,25 +519,3 @@ int chacha20poly1305_decrypt(
 
     return result;
 };
-
-
-// ======================================================
-// MAIN
-// ======================================================
-int main() {
-
-    vreg_set_voltage(VREG_VOLTAGE_1_30);
-    set_sys_clock_khz(400000, true);
-
-    stdio_init_all();
-    rosc_setup();
-    sleep_ms(9000);
-
-    bool RSA_Suc = RSA_test(190);
-    bool DH_Suc = DH_Test();
-    sleep_ms(100);
-
-    while (true) {
-        tight_loop_contents();
-    }
-}

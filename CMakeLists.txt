@@ -30,6 +30,10 @@ include(pico_sdk_import.cmake)
 
 project(mesh_network_v1 C CXX ASM)
 
+set(PICO_MBEDTLS_CONFIG_FILE
+    "${CMAKE_CURRENT_LIST_DIR}/mbedtls_config.h"
+)
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
@@ -76,6 +80,7 @@ target_link_libraries(mesh_network_v1
     hardware_gpio
     hardware_rtc
     hardware_uart
+    pico_mbedtls
     pico_rand)
 
 # Add the standard include files to the build
