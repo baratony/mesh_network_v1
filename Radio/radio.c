@@ -11,6 +11,10 @@
 #include "radio_packet_protocol.h"
 #include "Ethernet_FTP/ethernet_setup.h"
 #include "Ethernet_FTP/ftp_client.h"
+#include "Cryptographic_Functions/Cryptographic_Functions.h"
+#include "Cryptographic_Functions/Cryptographic_Functions.c"
+
+
 
 #define RADIO_NEIGHBOR_FILE_MAX_SIZE 1024
 #define RADIO_NEIGHBOR_COUNT_MAX 8
@@ -28,6 +32,13 @@
 #define RADIO_GLOBAL_ROUTE_MAX_ADDRESSES 16
 #define RADIO_GLOBAL_CONNECTIONS_MAX_NODES \
     (RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE / sizeof(uint32_t))
+#define RADIO_GLOBAL_RSA_KEYS_FILE "global_rsa_key_list"
+#define RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE 16384
+#define RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE 12
+#define RADIO_GLOBAL_RSA_KEYS_CHUNK_SIZE \
+    (RADIO_MAX_DATA - RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE)
+#define RADIO_GLOBAL_RSA_KEYS_RESPONSE_TIMEOUT_MS 10000
+#define RADIO_GLOBAL_RSA_KEYS_ATTEMPTS_PER_NEIGHBOR 2
 
 
 typedef struct
@@ -43,6 +54,9 @@ static bool neighbor_file_overflow;
 static uint8_t global_connections_file[RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE];
 static size_t global_connections_file_length;
 static bool global_connections_file_overflow;
+static uint8_t global_rsa_keys_file[RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE];
+static size_t global_rsa_keys_file_length;
+static bool global_rsa_keys_file_overflow;
 
 
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
@@ -76,6 +90,37 @@ static void radio_global_connections_file_cb(uint8_t *data, uint16_t length)
            data,
            length);
     global_connections_file_length += length;
+}
+
+
+static void radio_global_rsa_keys_file_cb(uint8_t *data, uint16_t length)
+{
+    size_t available = sizeof(global_rsa_keys_file) -
+                       global_rsa_keys_file_length;
+
+    if (length > available)
+    {
+        length = (uint16_t)available;
+        global_rsa_keys_file_overflow = true;
+    }
+
+    memcpy(&global_rsa_keys_file[global_rsa_keys_file_length], data, length);
+    global_rsa_keys_file_length += length;
+}
+
+
+static uint32_t radio_crc32(const uint8_t *data, size_t length)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+
+    for (size_t i = 0; i < length; ++i)
+    {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1u));
+    }
+
+    return ~crc;
 }
 
 
@@ -659,6 +704,267 @@ bool Respond_To_Global_Connections_Request(uint32_t global_address,
 }
 
 
+bool Request_Global_RSA_Keys(uint32_t global_address,
+                             e32_t *radio,
+                             ftp_client_t *ftp)
+{
+    if (radio == NULL || ftp == NULL)
+        return false;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        for (uint8_t j = (uint8_t)(i + 1); j < neighbor_count; ++j)
+        {
+            if (neighbors[j].global_address < neighbors[i].global_address)
+            {
+                radio_neighbor_t swap = neighbors[i];
+                neighbors[i] = neighbors[j];
+                neighbors[j] = swap;
+            }
+        }
+    }
+
+    static uint16_t sequence;
+    for (uint8_t neighbor_index = 0;
+         neighbor_index < neighbor_count;
+         ++neighbor_index)
+    {
+        radio_neighbor_t *provider = &neighbors[neighbor_index];
+        if (provider->global_address == global_address)
+            continue;
+
+        for (uint8_t attempt = 0;
+             attempt < RADIO_GLOBAL_RSA_KEYS_ATTEMPTS_PER_NEIGHBOR;
+             ++attempt)
+        {
+            ++sequence;
+            radio_packet_t request;
+            if (!radio_packet_create(&request,
+                                     global_address,
+                                     provider->global_address,
+                                     RADIO_CMD_RECEIVE_GLOBAL_RSA_KEYS,
+                                     RADIO_FLAG_ACK_REQUEST,
+                                     sequence) ||
+                !radio_send_packet(radio, &request, provider->local_address, 0))
+            {
+                printf("Failed to request RSA keys from %08lX\n",
+                       (unsigned long)provider->global_address);
+                continue;
+            }
+
+            global_rsa_keys_file_length = 0;
+            uint32_t expected_length = 0;
+            uint32_t expected_crc = 0;
+            absolute_time_t timeout = make_timeout_time_ms(
+                RADIO_GLOBAL_RSA_KEYS_RESPONSE_TIMEOUT_MS);
+
+            while (!time_reached(timeout))
+            {
+                radio_packet_t response;
+                if (radio_receive_packet(radio, &response) &&
+                    response.command == RADIO_CMD_SEND_GLOBAL_RSA_KEYS &&
+                    response.destination == global_address &&
+                    response.source == provider->global_address &&
+                    response.sequence == sequence &&
+                    response.length > RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE)
+                {
+                    uint32_t total_length = radio_read_u32_be(response.data);
+                    uint32_t offset = radio_read_u32_be(&response.data[4]);
+                    uint32_t file_crc = radio_read_u32_be(&response.data[8]);
+                    uint16_t chunk_length = (uint16_t)(response.length -
+                        RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE);
+
+                    if (total_length > 0 &&
+                        total_length <= sizeof(global_rsa_keys_file) &&
+                        offset == global_rsa_keys_file_length &&
+                        chunk_length <= RADIO_GLOBAL_RSA_KEYS_CHUNK_SIZE &&
+                        offset + chunk_length <= total_length &&
+                        (expected_length == 0 ||
+                         (expected_length == total_length &&
+                          expected_crc == file_crc)))
+                    {
+                        if (expected_length == 0)
+                        {
+                            expected_length = total_length;
+                            expected_crc = file_crc;
+                        }
+
+                        memcpy(&global_rsa_keys_file[offset],
+                               &response.data[RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE],
+                               chunk_length);
+                        global_rsa_keys_file_length += chunk_length;
+
+                        if (global_rsa_keys_file_length == expected_length)
+                            break;
+                    }
+                }
+
+                sleep_ms(1);
+            }
+
+            bool complete = expected_length > 0 &&
+                            global_rsa_keys_file_length == expected_length &&
+                            radio_crc32(global_rsa_keys_file,
+                                        global_rsa_keys_file_length) == expected_crc;
+            if (!complete)
+            {
+                printf("RSA key file from %08lX was incomplete or corrupted; retrying\n",
+                       (unsigned long)provider->global_address);
+                continue;
+            }
+
+            if (!ftp_upload(ftp,
+                            RADIO_GLOBAL_RSA_KEYS_FILE,
+                            global_rsa_keys_file,
+                            (uint32_t)global_rsa_keys_file_length))
+            {
+                printf("FTP upload of %s failed\n", RADIO_GLOBAL_RSA_KEYS_FILE);
+                ftp_disconnect(ftp);
+                return false;
+            }
+
+            radio_packet_t acknowledgement;
+            if (!radio_packet_create(&acknowledgement,
+                                     global_address,
+                                     provider->global_address,
+                                     RADIO_CMD_ACK,
+                                     RADIO_FLAG_ACK,
+                                     sequence) ||
+                !radio_send_packet(radio,
+                                   &acknowledgement,
+                                   provider->local_address,
+                                   0))
+            {
+                printf("RSA key file saved, but provider acknowledgement failed\n");
+                return false;
+            }
+
+            return true;
+        }
+    }
+
+    printf("Could not retrieve a valid RSA key file from any neighbor\n");
+    return false;
+}
+
+
+bool Respond_To_Global_RSA_Keys_Request(uint32_t global_address,
+                                        e32_t *radio,
+                                        ftp_client_t *ftp,
+                                        const radio_packet_t *request)
+{
+    if (radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_RECEIVE_GLOBAL_RSA_KEYS)
+        return false;
+
+    global_rsa_keys_file_length = 0;
+    global_rsa_keys_file_overflow = false;
+    if (!ftp_download(ftp,
+                      RADIO_GLOBAL_RSA_KEYS_FILE,
+                      radio_global_rsa_keys_file_cb) ||
+        global_rsa_keys_file_overflow ||
+        global_rsa_keys_file_length == 0)
+    {
+        printf("FTP %s download failed or is empty/too large\n",
+               RADIO_GLOBAL_RSA_KEYS_FILE);
+        return false;
+    }
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    uint16_t e32_destination = 0;
+    bool requester_found = false;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == request->source)
+        {
+            e32_destination = neighbors[i].local_address;
+            requester_found = true;
+            break;
+        }
+    }
+
+    if (!requester_found)
+    {
+        printf("RSA key requester is not present in local_neighbors.txt\n");
+        return false;
+    }
+
+    uint32_t file_crc = radio_crc32(global_rsa_keys_file,
+                                    global_rsa_keys_file_length);
+    uint32_t offset = 0;
+    while (offset < global_rsa_keys_file_length)
+    {
+        uint32_t remaining = (uint32_t)global_rsa_keys_file_length - offset;
+        uint16_t chunk_length = (uint16_t)(remaining >
+                                            RADIO_GLOBAL_RSA_KEYS_CHUNK_SIZE
+                                                ? RADIO_GLOBAL_RSA_KEYS_CHUNK_SIZE
+                                                : remaining);
+        uint8_t response_data[RADIO_MAX_DATA];
+        radio_write_u32_be(response_data,
+                           (uint32_t)global_rsa_keys_file_length);
+        radio_write_u32_be(&response_data[4], offset);
+        radio_write_u32_be(&response_data[8], file_crc);
+        memcpy(&response_data[RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE],
+               &global_rsa_keys_file[offset],
+               chunk_length);
+
+        radio_packet_t response;
+        if (!radio_packet_create(&response,
+                                 global_address,
+                                 request->source,
+                                 RADIO_CMD_SEND_GLOBAL_RSA_KEYS,
+                                 0,
+                                 request->sequence) ||
+            !radio_packet_set_data(&response,
+                                   response_data,
+                                   (uint16_t)(RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE +
+                                              chunk_length)) ||
+            !radio_send_packet(radio, &response, e32_destination, 0))
+        {
+            printf("Failed to send RSA key file chunk\n");
+            return false;
+        }
+
+        offset += chunk_length;
+    }
+
+    return true;
+}
+
+
 bool Find_Shortest_Global_Route(uint32_t source,
                                 uint32_t destination,
                                 ftp_client_t *ftp,
@@ -1001,6 +1307,14 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                                      radio,
                                                      ftp,
                                                      packet);
+    }
+
+    if (packet->command == RADIO_CMD_RECEIVE_GLOBAL_RSA_KEYS)
+    {
+        return Respond_To_Global_RSA_Keys_Request(global_address,
+                                                  radio,
+                                                  ftp,
+                                                  packet);
     }
 
     if (packet->command == RADIO_CMD_RELAY_NEW_NODE)
