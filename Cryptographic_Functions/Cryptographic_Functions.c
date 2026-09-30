@@ -389,7 +389,7 @@ bool DH_Test() {
     mpz_init(seed);
     mpz_init(rn);
 
-    mpz_set_ui(g, 2); // Set generator two, the generator does not have to be a large number
+    // Set generator two, the generator does not have to be a large number
 
     // Generate a and b
     DH_Generate_Private_Number(a);

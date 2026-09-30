@@ -23,6 +23,7 @@
 #define RADIO_CONNECTION_RESPONSE_TIMEOUT_MS 5000
 #define RADIO_GLOBAL_CONNECTIONS_FILE "global_connections.bin"
 #define RADIO_GLOBAL_CONNECTIONS_ROW_SIZE (9u * sizeof(uint32_t))
+#define RADIO_NEW_NODE_RECORD_SIZE (9u * sizeof(uint32_t))
 #define RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE 4096
 #define RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE 8
 #define RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE \
@@ -39,6 +40,14 @@
     (RADIO_MAX_DATA - RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE)
 #define RADIO_GLOBAL_RSA_KEYS_RESPONSE_TIMEOUT_MS 10000
 #define RADIO_GLOBAL_RSA_KEYS_ATTEMPTS_PER_NEIGHBOR 2
+#define RADIO_RSA_PUBLIC_MODULUS_BITS 2048
+#define RADIO_RSA_PUBLIC_MODULUS_SIZE (RADIO_RSA_PUBLIC_MODULUS_BITS / 8)
+#define RADIO_RSA_KEY_ROW_SIZE (sizeof(uint32_t) + RADIO_RSA_PUBLIC_MODULUS_SIZE)
+#define RADIO_DH_MODULUS_BITS 1028u
+#define RADIO_DH_RSA_FRAGMENT_HEADER_SIZE 4u
+#define RADIO_DH_RSA_FRAGMENT_DATA_SIZE \
+    (RADIO_MAX_DATA - RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
+#define RADIO_DH_RSA_CIPHERTEXT_MAX_SIZE 512u
 
 
 typedef struct
@@ -57,6 +66,8 @@ static bool global_connections_file_overflow;
 static uint8_t global_rsa_keys_file[RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE];
 static size_t global_rsa_keys_file_length;
 static bool global_rsa_keys_file_overflow;
+
+static uint32_t radio_read_u32_be(const uint8_t *data);
 
 
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
@@ -124,6 +135,63 @@ static uint32_t radio_crc32(const uint8_t *data, size_t length)
 }
 
 
+static bool radio_rsa_key_address_saved(uint32_t global_address)
+{
+    if (global_rsa_keys_file_length % RADIO_RSA_KEY_ROW_SIZE != 0)
+        return false;
+
+    for (size_t offset = 0;
+         offset < global_rsa_keys_file_length;
+         offset += RADIO_RSA_KEY_ROW_SIZE)
+    {
+        if (radio_read_u32_be(&global_rsa_keys_file[offset]) == global_address)
+            return true;
+    }
+
+    return false;
+}
+
+
+static bool radio_encode_rsa_public_modulus(mpz_t public_modulo,
+                                            uint8_t output[RADIO_RSA_PUBLIC_MODULUS_SIZE])
+{
+    if (mpz_sgn(public_modulo) <= 0 ||
+        mpz_sizeinbase(public_modulo, 2) != RADIO_RSA_PUBLIC_MODULUS_BITS)
+        return false;
+
+    size_t exported_length = 0;
+    memset(output, 0, RADIO_RSA_PUBLIC_MODULUS_SIZE);
+    mpz_export(output,
+               &exported_length,
+               1,
+               1,
+               1,
+               0,
+               public_modulo);
+
+    if (exported_length > RADIO_RSA_PUBLIC_MODULUS_SIZE)
+        return false;
+
+    if (exported_length < RADIO_RSA_PUBLIC_MODULUS_SIZE)
+    {
+        memmove(&output[RADIO_RSA_PUBLIC_MODULUS_SIZE - exported_length],
+                output,
+                exported_length);
+        memset(output, 0, RADIO_RSA_PUBLIC_MODULUS_SIZE - exported_length);
+    }
+
+    return true;
+}
+
+
+static bool radio_valid_rsa_public_modulus(const uint8_t *modulus)
+{
+    return modulus != NULL &&
+           (modulus[0] & 0x80u) != 0 &&
+           (modulus[RADIO_RSA_PUBLIC_MODULUS_SIZE - 1] & 1u) != 0;
+}
+
+
 static uint32_t radio_read_u32_be(const uint8_t *data)
 {
     return ((uint32_t)data[0] << 24) |
@@ -162,6 +230,26 @@ static bool radio_download_global_connections(ftp_client_t *ftp)
 }
 
 
+static bool radio_find_global_connection_row(uint32_t address,
+                                             size_t *row_index)
+{
+    size_t row_count = global_connections_file_length /
+                       RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+
+    for (size_t row = 0; row < row_count; ++row)
+    {
+        size_t offset = row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+        if (radio_read_global_connection_word(offset) == address)
+        {
+            *row_index = row;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
 static bool radio_global_connection_saved(uint32_t global_address)
 {
     for (size_t offset = 0;
@@ -176,56 +264,78 @@ static bool radio_global_connection_saved(uint32_t global_address)
 }
 
 
-static bool radio_add_global_connection(uint32_t local_global_address,
-                                        uint32_t new_global_address)
+static bool radio_ensure_global_connection_row(uint32_t address,
+                                               size_t *row_index,
+                                               bool *changed)
 {
-    if (radio_global_connection_saved(new_global_address))
+    if (radio_find_global_connection_row(address, row_index))
+        return true;
+
+    if (global_connections_file_length + RADIO_GLOBAL_CONNECTIONS_ROW_SIZE >
+        sizeof(global_connections_file))
         return false;
 
-    size_t row_count = global_connections_file_length /
-                       RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
-    size_t local_row = row_count;
+    *row_index = global_connections_file_length /
+                 RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    memset(&global_connections_file[global_connections_file_length],
+           0,
+           RADIO_GLOBAL_CONNECTIONS_ROW_SIZE);
+    radio_write_global_connection_word(global_connections_file_length,
+                                       address);
+    global_connections_file_length += RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    *changed = true;
+    return true;
+}
 
-    for (size_t row = 0; row < row_count; ++row)
-    {
-        if (radio_read_global_connection_word(row *
-                                              RADIO_GLOBAL_CONNECTIONS_ROW_SIZE) ==
-            local_global_address)
-        {
-            local_row = row;
-            break;
-        }
-    }
 
-    if (local_row == row_count)
-    {
-        if (global_connections_file_length + RADIO_GLOBAL_CONNECTIONS_ROW_SIZE >
-            sizeof(global_connections_file))
-            return false;
+static bool radio_add_connection_to_row(size_t row_index,
+                                        uint32_t neighbor_address,
+                                        bool *changed)
+{
+    size_t row_offset = row_index * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    size_t empty_offset = RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
 
-        size_t row_offset = global_connections_file_length;
-        memset(&global_connections_file[row_offset],
-               0,
-               RADIO_GLOBAL_CONNECTIONS_ROW_SIZE);
-        radio_write_global_connection_word(row_offset, local_global_address);
-        radio_write_global_connection_word(row_offset + sizeof(uint32_t),
-                                           new_global_address);
-        global_connections_file_length += RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
-        return true;
-    }
-
-    size_t row_offset = local_row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
     for (uint8_t column = 1; column < 9; ++column)
     {
         size_t offset = row_offset + column * sizeof(uint32_t);
-        if (radio_read_global_connection_word(offset) == 0)
-        {
-            radio_write_global_connection_word(offset, new_global_address);
+        uint32_t existing = radio_read_global_connection_word(offset);
+        if (existing == neighbor_address)
             return true;
-        }
+        if (existing == 0 && empty_offset == RADIO_GLOBAL_CONNECTIONS_ROW_SIZE)
+            empty_offset = offset - row_offset;
     }
 
-    return false;
+    if (empty_offset == RADIO_GLOBAL_CONNECTIONS_ROW_SIZE)
+        return false;
+
+    radio_write_global_connection_word(row_offset + empty_offset,
+                                       neighbor_address);
+    *changed = true;
+    return true;
+}
+
+
+static bool radio_add_connection_edge(uint32_t first_address,
+                                      uint32_t second_address,
+                                      bool *changed)
+{
+    if (first_address == 0 || second_address == 0 ||
+        first_address == second_address)
+        return false;
+
+    size_t first_row;
+    size_t second_row;
+    if (!radio_ensure_global_connection_row(first_address,
+                                            &first_row,
+                                            changed) ||
+        !radio_ensure_global_connection_row(second_address,
+                                            &second_row,
+                                            changed))
+        return false;
+
+    if (!radio_add_connection_to_row(first_row, second_address, changed))
+        return false;
+    return radio_add_connection_to_row(second_row, first_address, changed);
 }
 
 
@@ -1164,6 +1274,17 @@ bool Relay_New_Node(uint32_t global_address,
         return false;
     }
 
+    uint8_t node_record[RADIO_NEW_NODE_RECORD_SIZE] = {0};
+    radio_write_u32_be(node_record, global_address);
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address != global_address)
+        {
+            radio_write_u32_be(&node_record[(i + 1u) * sizeof(uint32_t)],
+                               neighbors[i].global_address);
+        }
+    }
+
     static uint16_t sequence;
     bool sent = true;
     for (uint8_t i = 0; i < neighbor_count; ++i)
@@ -1175,6 +1296,9 @@ bool Relay_New_Node(uint32_t global_address,
                                  RADIO_CMD_RELAY_NEW_NODE,
                                  RADIO_FLAG_ACK_REQUEST,
                                  ++sequence) ||
+                        !radio_packet_set_data(&packet,
+                                                                     node_record,
+                                                                     sizeof(node_record)) ||
             !radio_send_packet(radio, &packet, neighbors[i].local_address, 0))
         {
             printf("Failed to announce new node to %08lX\n",
@@ -1194,14 +1318,36 @@ bool Respond_To_New_Node(uint32_t global_address,
 {
     if (radio == NULL || ftp == NULL || request == NULL ||
         request->command != RADIO_CMD_RELAY_NEW_NODE ||
-        request->source == 0)
+        request->source == 0 ||
+        request->length != RADIO_NEW_NODE_RECORD_SIZE)
         return false;
 
     uint32_t new_global_address = request->source;
+    if (radio_read_u32_be(request->data) != new_global_address)
+        return false;
 
     /* The origin already knows its own address; do not bounce the packet. */
     if (new_global_address == global_address)
         return true;
+
+    uint32_t announced_neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t announced_count = 0;
+    for (uint8_t i = 0; i < RADIO_NEIGHBOR_COUNT_MAX; ++i)
+    {
+        uint32_t neighbor = radio_read_u32_be(
+            &request->data[(i + 1u) * sizeof(uint32_t)]);
+        if (neighbor == 0)
+            continue;
+        if (neighbor == new_global_address)
+            return false;
+
+        for (uint8_t j = 0; j < announced_count; ++j)
+        {
+            if (announced_neighbors[j] == neighbor)
+                return false;
+        }
+        announced_neighbors[announced_count++] = neighbor;
+    }
 
     if (!radio_download_global_connections(ftp))
     {
@@ -1210,18 +1356,33 @@ bool Respond_To_New_Node(uint32_t global_address,
         return false;
     }
 
-    /* Duplicate announcements stop here, which prevents relay loops. */
-    if (radio_global_connection_saved(new_global_address))
-        return true;
-
-    if (!radio_add_global_connection(global_address, new_global_address))
+    bool already_known = radio_global_connection_saved(new_global_address);
+    bool changed = false;
+    size_t new_node_row;
+    if (!radio_ensure_global_connection_row(new_global_address,
+                                            &new_node_row,
+                                            &changed))
     {
-        printf("Could not add %08lX to the global connection file\n",
+        printf("Could not create a connection row for %08lX\n",
                (unsigned long)new_global_address);
         return false;
     }
 
-    if (!ftp_upload(ftp,
+    for (uint8_t i = 0; i < announced_count; ++i)
+    {
+        if (!radio_add_connection_edge(new_global_address,
+                                       announced_neighbors[i],
+                                       &changed))
+        {
+            printf("Could not add connection between %08lX and %08lX\n",
+                   (unsigned long)new_global_address,
+                   (unsigned long)announced_neighbors[i]);
+            return false;
+        }
+    }
+
+    if (changed &&
+        !ftp_upload(ftp,
                     RADIO_GLOBAL_CONNECTIONS_FILE,
                     global_connections_file,
                     (uint32_t)global_connections_file_length))
@@ -1230,6 +1391,10 @@ bool Respond_To_New_Node(uint32_t global_address,
         ftp_disconnect(ftp);
         return false;
     }
+
+    /* Known nodes may need missing graph edges repaired, but not rebroadcast. */
+    if (already_known)
+        return true;
 
     neighbor_file_length = 0;
     neighbor_file_overflow = false;
@@ -1259,9 +1424,175 @@ bool Respond_To_New_Node(uint32_t global_address,
                                  RADIO_CMD_RELAY_NEW_NODE,
                                  RADIO_FLAG_ACK_REQUEST,
                                  ++sequence) ||
+                        !radio_packet_set_data(&packet,
+                                                                     request->data,
+                                                                     request->length) ||
             !radio_send_packet(radio, &packet, neighbors[i].local_address, 0))
         {
             printf("Failed to relay new node to %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    return sent;
+}
+
+
+bool Relay_RSA_Public_Key(uint32_t global_address,
+                          mpz_t public_modulo,
+                          e32_t *radio,
+                          ftp_client_t *ftp)
+{
+    if (global_address == 0 || radio == NULL || ftp == NULL)
+        return false;
+
+    uint8_t modulus[RADIO_RSA_PUBLIC_MODULUS_SIZE];
+    if (!radio_encode_rsa_public_modulus(public_modulo, modulus))
+    {
+        printf("Public RSA modulo must be a positive 2048-bit value\n");
+        return false;
+    }
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == global_address)
+            continue;
+
+        radio_packet_t packet;
+        if (!radio_packet_create(&packet,
+                                 global_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_RELAY_RSA_KEYS,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 ++sequence) ||
+            !radio_packet_set_data(&packet, modulus, sizeof(modulus)) ||
+            !radio_send_packet(radio, &packet, neighbors[i].local_address, 0))
+        {
+            printf("Failed to relay RSA public key to %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    return sent;
+}
+
+
+bool Respond_To_RSA_Key_Relay(uint32_t global_address,
+                              e32_t *radio,
+                              ftp_client_t *ftp,
+                              const radio_packet_t *request)
+{
+    if (radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_RELAY_RSA_KEYS ||
+        request->source == 0 ||
+        request->length != RADIO_RSA_PUBLIC_MODULUS_SIZE ||
+        !radio_valid_rsa_public_modulus(request->data))
+        return false;
+
+    uint32_t owner_address = request->source;
+
+    /* The originating node receives its own relay and already has the key. */
+    if (owner_address == global_address)
+        return true;
+
+    global_rsa_keys_file_length = 0;
+    global_rsa_keys_file_overflow = false;
+    if (!ftp_download(ftp,
+                      RADIO_GLOBAL_RSA_KEYS_FILE,
+                      radio_global_rsa_keys_file_cb) ||
+        global_rsa_keys_file_overflow ||
+        global_rsa_keys_file_length % RADIO_RSA_KEY_ROW_SIZE != 0)
+    {
+        printf("FTP %s download failed or has an invalid row format\n",
+               RADIO_GLOBAL_RSA_KEYS_FILE);
+        return false;
+    }
+
+    if (radio_rsa_key_address_saved(owner_address))
+        return true;
+
+    if (global_rsa_keys_file_length + RADIO_RSA_KEY_ROW_SIZE >
+        sizeof(global_rsa_keys_file))
+    {
+        printf("RSA public key list is full\n");
+        return false;
+    }
+
+    size_t row_offset = global_rsa_keys_file_length;
+    radio_write_u32_be(&global_rsa_keys_file[row_offset], owner_address);
+    memcpy(&global_rsa_keys_file[row_offset + sizeof(uint32_t)],
+           request->data,
+           RADIO_RSA_PUBLIC_MODULUS_SIZE);
+    global_rsa_keys_file_length += RADIO_RSA_KEY_ROW_SIZE;
+
+    if (!ftp_upload(ftp,
+                    RADIO_GLOBAL_RSA_KEYS_FILE,
+                    global_rsa_keys_file,
+                    (uint32_t)global_rsa_keys_file_length))
+    {
+        printf("FTP upload of %s failed\n", RADIO_GLOBAL_RSA_KEYS_FILE);
+        ftp_disconnect(ftp);
+        return false;
+    }
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == global_address)
+            continue;
+
+        radio_packet_t relay;
+        if (!radio_packet_create(&relay,
+                                 owner_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_RELAY_RSA_KEYS,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 ++sequence) ||
+            !radio_packet_set_data(&relay,
+                                   request->data,
+                                   RADIO_RSA_PUBLIC_MODULUS_SIZE) ||
+            !radio_send_packet(radio, &relay, neighbors[i].local_address, 0))
+        {
+            printf("Failed to forward RSA public key to %08lX\n",
                    (unsigned long)neighbors[i].global_address);
             sent = false;
         }
@@ -1323,6 +1654,14 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                    radio,
                                    ftp,
                                    packet);
+    }
+
+    if (packet->command == RADIO_CMD_RELAY_RSA_KEYS)
+    {
+        return Respond_To_RSA_Key_Relay(global_address,
+                                        radio,
+                                        ftp,
+                                        packet);
     }
 
     return false;
@@ -1660,3 +1999,159 @@ upload_neighbors:
 }
 
 e32_t radio;
+
+bool Create_DH_Exchange_Packet(uint32_t target_global_address,
+                               uint32_t personal_global_address,
+                               const uint32_t *route,
+                               uint8_t *route_length,
+                               uint16_t first_hop_local_address,
+                               mpz_t private_rsa_exponent,
+                               mpz_t rsa_modulus)
+{
+    if (route == NULL || route_length == NULL || *route_length < 2 ||
+        *route_length > RADIO_MAX_ROUTE_ADDRESSES ||
+        route[0] != personal_global_address ||
+        route[*route_length - 1u] != target_global_address ||
+        mpz_sgn(private_rsa_exponent) <= 0 || mpz_sgn(rsa_modulus) <= 0)
+        return false;
+
+    mpz_t private_number;
+    mpz_t sending_number;
+    mpz_t modulus;
+    mpz_t random_number;
+    mpz_t seed;
+    mpz_t generator;
+    mpz_t packed_message;
+    mpz_t cipher_text;
+
+    mpz_init(private_number);
+    mpz_init(sending_number);
+    mpz_init(modulus);
+    mpz_init(random_number);
+    mpz_init(seed);
+    mpz_init(generator);
+    mpz_init(packed_message);
+    mpz_init(cipher_text);
+
+    bool success = false;
+    uint8_t cipher_bytes[RADIO_DH_RSA_CIPHERTEXT_MAX_SIZE];
+
+    do
+    {
+        generate_random_seed(seed, 256);
+        generate_random_number(seed,
+                              random_number,
+                              RADIO_DH_MODULUS_BITS,
+                              256);
+        mpz_setbit(random_number, RADIO_DH_MODULUS_BITS - 1u);
+        mpz_setbit(random_number, 0);
+        generate_random_prime_number(random_number, modulus);
+    } while (mpz_sizeinbase(modulus, 2) > RADIO_DH_MODULUS_BITS);
+
+    mpz_set_ui(generator, 2);
+    DH_Generate_Private_Number(private_number);
+    DH_Generate_Sending_Number(sending_number,
+                               generator,
+                               modulus,
+                               private_number);
+
+    if (mpz_sgn(sending_number) < 0 ||
+        mpz_sizeinbase(sending_number, 2) > RADIO_DH_MODULUS_BITS)
+        goto cleanup;
+
+    mpz_mul_2exp(packed_message, modulus, RADIO_DH_MODULUS_BITS);
+    mpz_add(packed_message, packed_message, sending_number);
+
+    if (mpz_cmp(packed_message, rsa_modulus) >= 0)
+    {
+        printf("RSA modulus is too small for the packed DH values\n");
+        goto cleanup;
+    }
+
+    RSA_encrypt(packed_message,
+                private_rsa_exponent,
+                rsa_modulus,
+                cipher_text);
+
+    size_t cipher_length = (mpz_sizeinbase(rsa_modulus, 2) + 7u) / 8u;
+    if (cipher_length == 0 ||
+        cipher_length > sizeof(cipher_bytes))
+    {
+        printf("RSA ciphertext exceeds the supported fragment limit\n");
+        goto cleanup;
+    }
+
+    memset(cipher_bytes, 0, sizeof(cipher_bytes));
+    size_t exported_length = 0;
+    mpz_export(cipher_bytes,
+               &exported_length,
+               1,
+               1,
+               1,
+               0,
+               cipher_text);
+    if (exported_length > cipher_length)
+        goto cleanup;
+
+    if (exported_length < cipher_length)
+    {
+        memmove(&cipher_bytes[cipher_length - exported_length],
+                cipher_bytes,
+                exported_length);
+        memset(cipher_bytes, 0, cipher_length - exported_length);
+    }
+
+    static uint16_t sequence;
+    ++sequence;
+    for (size_t offset = 0; offset < cipher_length;)
+    {
+        size_t remaining = cipher_length - offset;
+        uint16_t fragment_length = (uint16_t)(remaining >
+                                               RADIO_DH_RSA_FRAGMENT_DATA_SIZE
+                                                   ? RADIO_DH_RSA_FRAGMENT_DATA_SIZE
+                                                   : remaining);
+        uint8_t fragment_data[RADIO_MAX_DATA];
+        radio_write_u16_be(fragment_data, (uint16_t)cipher_length);
+        radio_write_u16_be(&fragment_data[2], (uint16_t)offset);
+        memcpy(&fragment_data[RADIO_DH_RSA_FRAGMENT_HEADER_SIZE],
+               &cipher_bytes[offset],
+               fragment_length);
+
+        radio_packet_t packet;
+        if (!radio_packet_create(&packet,
+                                 personal_global_address,
+                                 target_global_address,
+                                 RADIO_CMD_SEND_ENCRYPTION_REQUEST,
+                                 RADIO_FLAG_ACK_REQUEST | RADIO_FLAG_FRAGMENT,
+                                 sequence) ||
+            !radio_packet_set_path(&packet, route, *route_length) ||
+            !radio_packet_set_data(&packet,
+                                   fragment_data,
+                                   (uint16_t)(RADIO_DH_RSA_FRAGMENT_HEADER_SIZE +
+                                              fragment_length)) ||
+            !radio_send_packet(&radio,
+                               &packet,
+                               first_hop_local_address,
+                               0))
+        {
+            printf("Failed to send encryption request to %08lX\n",
+                   (unsigned long)target_global_address);
+            goto cleanup;
+        }
+
+        offset += fragment_length;
+    }
+
+    success = true;
+
+cleanup:
+    mpz_clear(private_number);
+    mpz_clear(sending_number);
+    mpz_clear(modulus);
+    mpz_clear(random_number);
+    mpz_clear(seed);
+    mpz_clear(generator);
+    mpz_clear(packed_message);
+    mpz_clear(cipher_text);
+    return success;
+}
