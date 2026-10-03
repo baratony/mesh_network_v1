@@ -43,11 +43,24 @@
 #define RADIO_RSA_PUBLIC_MODULUS_BITS 2048
 #define RADIO_RSA_PUBLIC_MODULUS_SIZE (RADIO_RSA_PUBLIC_MODULUS_BITS / 8)
 #define RADIO_RSA_KEY_ROW_SIZE (sizeof(uint32_t) + RADIO_RSA_PUBLIC_MODULUS_SIZE)
-#define RADIO_DH_MODULUS_BITS 1028u
+#define RADIO_DH_MODULUS_BITS 1023u
+#define RADIO_DH_FIELD_SIZE ((RADIO_DH_MODULUS_BITS + 7u) / 8u)
+#define RADIO_DH_MESSAGE_SIZE (2u * RADIO_DH_FIELD_SIZE)
+#define RADIO_DH_HASH_SIZE 32u
+#define RADIO_DH_RESPONSE_MESSAGE_SIZE \
+    (RADIO_DH_FIELD_SIZE + RADIO_DH_HASH_SIZE)
+#define RADIO_DH_PRIVATE_SIZE 32u
+#define RADIO_DH_SIGNATURE_SIZE RADIO_RSA_PUBLIC_MODULUS_SIZE
+#define RADIO_DH_SIGNATURE_CONTEXT_SIZE 12u
+#define RADIO_DH_SIGNATURE_INPUT_MAX_SIZE \
+    (RADIO_DH_SIGNATURE_CONTEXT_SIZE + RADIO_DH_MESSAGE_SIZE)
+#define RADIO_DH_SIGNED_REQUEST_SIZE \
+    (RADIO_DH_MESSAGE_SIZE + RADIO_DH_SIGNATURE_SIZE)
+#define RADIO_DH_SIGNED_RESPONSE_SIZE \
+    (RADIO_DH_RESPONSE_MESSAGE_SIZE + RADIO_DH_SIGNATURE_SIZE)
 #define RADIO_DH_RSA_FRAGMENT_HEADER_SIZE 4u
 #define RADIO_DH_RSA_FRAGMENT_DATA_SIZE \
     (RADIO_MAX_DATA - RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
-#define RADIO_DH_RSA_CIPHERTEXT_MAX_SIZE 512u
 
 
 typedef struct
@@ -66,8 +79,34 @@ static bool global_connections_file_overflow;
 static uint8_t global_rsa_keys_file[RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE];
 static size_t global_rsa_keys_file_length;
 static bool global_rsa_keys_file_overflow;
+static uint8_t dh_request_reassembly[RADIO_DH_SIGNED_REQUEST_SIZE];
+static size_t dh_request_reassembly_length;
+static uint32_t dh_request_reassembly_source;
+static uint16_t dh_request_reassembly_sequence;
+static bool dh_request_reassembly_active;
+static uint32_t dh_request_completed_source;
+static uint16_t dh_request_completed_sequence;
+static bool dh_request_completed_valid;
+static uint8_t dh_response_reassembly[RADIO_DH_SIGNED_RESPONSE_SIZE];
+static size_t dh_response_reassembly_length;
+static uint32_t dh_response_reassembly_source;
+static uint16_t dh_response_reassembly_sequence;
+static bool dh_response_reassembly_active;
+static uint8_t dh_pending_private[RADIO_DH_PRIVATE_SIZE];
+static uint8_t dh_pending_modulus[RADIO_DH_FIELD_SIZE];
+static uint32_t dh_pending_source;
+static uint32_t dh_pending_destination;
+static uint16_t dh_pending_sequence;
+static bool dh_pending_active;
+static uint32_t dh_responder_pending_source;
+static uint16_t dh_responder_pending_sequence;
+static bool dh_responder_pending_active;
 
 static uint32_t radio_read_u32_be(const uint8_t *data);
+static void radio_write_u16_be(uint8_t *data, uint16_t value);
+static void radio_write_u32_be(uint8_t *data, uint32_t value);
+static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
+                                      uint8_t *neighbor_count);
 
 
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
@@ -198,6 +237,320 @@ static uint32_t radio_read_u32_be(const uint8_t *data)
            ((uint32_t)data[1] << 16) |
            ((uint32_t)data[2] << 8) |
            (uint32_t)data[3];
+}
+
+
+static uint16_t radio_read_u16_be_value(const uint8_t *data)
+{
+    return (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+}
+
+
+static bool radio_export_mpz_fixed(mpz_t value, uint8_t *output, size_t length)
+{
+    if (mpz_sgn(value) < 0 || output == NULL || length == 0 ||
+        mpz_sizeinbase(value, 2) > length * 8u)
+        return false;
+
+    memset(output, 0, length);
+    size_t exported_length = 0;
+    mpz_export(output, &exported_length, 1, 1, 1, 0, value);
+    if (exported_length > length)
+        return false;
+
+    if (exported_length < length)
+    {
+        memmove(&output[length - exported_length], output, exported_length);
+        memset(output, 0, length - exported_length);
+    }
+
+    return true;
+}
+
+
+static void radio_import_mpz_fixed(mpz_t value,
+                                   const uint8_t *input,
+                                   size_t length)
+{
+    mpz_import(value, length, 1, 1, 1, 0, input);
+}
+
+
+static bool radio_build_rsa_sha256_digest_info(const uint8_t *data,
+                                                size_t data_length,
+                                                uint8_t encoded[RADIO_RSA_PUBLIC_MODULUS_SIZE])
+{
+    static const uint8_t digest_info_prefix[] = {
+        0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20
+    };
+    uint8_t digest[32];
+    const size_t padding_length = RADIO_RSA_PUBLIC_MODULUS_SIZE - 3u -
+                                  sizeof(digest_info_prefix) - sizeof(digest);
+
+    if (data == NULL || padding_length < 8u)
+        return false;
+
+    sha256_hash(data, data_length, digest);
+    encoded[0] = 0;
+    encoded[1] = 1;
+    memset(&encoded[2], 0xFF, padding_length);
+    encoded[2u + padding_length] = 0;
+    memcpy(&encoded[3u + padding_length],
+           digest_info_prefix,
+           sizeof(digest_info_prefix));
+    memcpy(&encoded[3u + padding_length + sizeof(digest_info_prefix)],
+           digest,
+           sizeof(digest));
+    return true;
+}
+
+
+static bool radio_rsa_sign_sha256(const uint8_t *data,
+                                 size_t data_length,
+                                 mpz_t private_exponent,
+                                 mpz_t rsa_modulus,
+                                 uint8_t signature[RADIO_DH_SIGNATURE_SIZE])
+{
+    if (data == NULL || mpz_sgn(private_exponent) <= 0 ||
+        mpz_sizeinbase(rsa_modulus, 2) != RADIO_RSA_PUBLIC_MODULUS_BITS)
+        return false;
+
+    uint8_t encoded[RADIO_RSA_PUBLIC_MODULUS_SIZE];
+    mpz_t encoded_message;
+    mpz_t signature_value;
+    mpz_init(encoded_message);
+    mpz_init(signature_value);
+
+    bool success = radio_build_rsa_sha256_digest_info(data,
+                                                       data_length,
+                                                       encoded);
+    if (success)
+    {
+        radio_import_mpz_fixed(encoded_message, encoded, sizeof(encoded));
+        if (mpz_cmp(encoded_message, rsa_modulus) >= 0)
+            success = false;
+    }
+
+    if (success)
+    {
+        RSA_encrypt(encoded_message,
+                    private_exponent,
+                    rsa_modulus,
+                    signature_value);
+        success = radio_export_mpz_fixed(signature_value,
+                                         signature,
+                                         RADIO_DH_SIGNATURE_SIZE);
+    }
+
+    mpz_clear(encoded_message);
+    mpz_clear(signature_value);
+    return success;
+}
+
+
+static bool radio_rsa_verify_sha256(const uint8_t *data,
+                                   size_t data_length,
+                                   const uint8_t signature[RADIO_DH_SIGNATURE_SIZE],
+                                   mpz_t public_exponent,
+                                   mpz_t rsa_modulus)
+{
+    if (data == NULL || signature == NULL || mpz_sgn(public_exponent) <= 0 ||
+        mpz_sizeinbase(rsa_modulus, 2) != RADIO_RSA_PUBLIC_MODULUS_BITS)
+        return false;
+
+    uint8_t expected[RADIO_RSA_PUBLIC_MODULUS_SIZE];
+    uint8_t recovered[RADIO_RSA_PUBLIC_MODULUS_SIZE];
+    mpz_t signature_value;
+    mpz_t recovered_message;
+    mpz_init(signature_value);
+    mpz_init(recovered_message);
+
+    bool success = radio_build_rsa_sha256_digest_info(data,
+                                                       data_length,
+                                                       expected);
+    if (success)
+    {
+        radio_import_mpz_fixed(signature_value,
+                               signature,
+                               RADIO_DH_SIGNATURE_SIZE);
+        if (mpz_cmp(signature_value, rsa_modulus) >= 0)
+            success = false;
+    }
+
+    if (success)
+    {
+        RSA_encrypt(signature_value,
+                    public_exponent,
+                    rsa_modulus,
+                    recovered_message);
+        success = radio_export_mpz_fixed(recovered_message,
+                                         recovered,
+                                         sizeof(recovered)) &&
+                  memcmp(expected, recovered, sizeof(expected)) == 0;
+    }
+
+    mpz_clear(signature_value);
+    mpz_clear(recovered_message);
+    return success;
+}
+
+
+static void radio_build_dh_signature_input(uint16_t command,
+                                           uint32_t source,
+                                           uint32_t destination,
+                                           uint16_t sequence,
+                                           const uint8_t *message,
+                                           size_t message_length,
+                                           uint8_t *input)
+{
+    radio_write_u16_be(input, command);
+    radio_write_u32_be(&input[2], source);
+    radio_write_u32_be(&input[6], destination);
+    radio_write_u16_be(&input[10], sequence);
+    if (message_length > 0)
+        memcpy(&input[RADIO_DH_SIGNATURE_CONTEXT_SIZE],
+               message,
+               message_length);
+}
+
+
+static bool radio_load_rsa_public_key(ftp_client_t *ftp,
+                                      uint32_t global_address,
+                                      mpz_t public_exponent,
+                                      mpz_t public_modulus)
+{
+    global_rsa_keys_file_length = 0;
+    global_rsa_keys_file_overflow = false;
+    if (ftp == NULL ||
+        !ftp_download(ftp,
+                      RADIO_GLOBAL_RSA_KEYS_FILE,
+                      radio_global_rsa_keys_file_cb) ||
+        global_rsa_keys_file_overflow ||
+        global_rsa_keys_file_length % RADIO_RSA_KEY_ROW_SIZE != 0)
+        return false;
+
+    for (size_t offset = 0;
+         offset < global_rsa_keys_file_length;
+         offset += RADIO_RSA_KEY_ROW_SIZE)
+    {
+        const uint8_t *modulus_bytes =
+            &global_rsa_keys_file[offset + sizeof(uint32_t)];
+        if (radio_read_u32_be(&global_rsa_keys_file[offset]) != global_address)
+            continue;
+
+        if (!radio_valid_rsa_public_modulus(modulus_bytes))
+            return false;
+
+        radio_import_mpz_fixed(public_modulus,
+                               modulus_bytes,
+                               RADIO_RSA_PUBLIC_MODULUS_SIZE);
+        if (mpz_sizeinbase(public_modulus, 2) !=
+            RADIO_RSA_PUBLIC_MODULUS_BITS)
+            return false;
+
+        mpz_set_ui(public_exponent, 65537u);
+        return true;
+    }
+
+    printf("No RSA public key found for %08lX\n",
+           (unsigned long)global_address);
+    return false;
+}
+
+
+static bool radio_find_neighbor_local_address(ftp_client_t *ftp,
+                                               uint32_t global_address,
+                                               uint16_t *local_address)
+{
+    if (ftp == NULL || local_address == NULL)
+        return false;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+        return false;
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+        return false;
+
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == global_address)
+        {
+            *local_address = neighbors[i].local_address;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+static bool radio_send_dh_signed_message(e32_t *device,
+                                         uint32_t source,
+                                         uint32_t destination,
+                                         const uint32_t *route,
+                                         uint8_t route_length,
+                                         uint16_t first_hop_local_address,
+                                         uint16_t command,
+                                         uint16_t sequence,
+                                         const uint8_t *message,
+                                         size_t message_length,
+                                         const uint8_t signature[RADIO_DH_SIGNATURE_SIZE])
+{
+    if (device == NULL || route == NULL || message == NULL || signature == NULL ||
+        message_length > RADIO_DH_MESSAGE_SIZE ||
+        message_length + RADIO_DH_SIGNATURE_SIZE > RADIO_DH_SIGNED_REQUEST_SIZE)
+        return false;
+
+    uint8_t signed_request[RADIO_DH_SIGNED_REQUEST_SIZE];
+    size_t signed_request_length = message_length + RADIO_DH_SIGNATURE_SIZE;
+    memcpy(signed_request, message, message_length);
+    memcpy(&signed_request[message_length],
+           signature,
+           RADIO_DH_SIGNATURE_SIZE);
+
+    for (size_t offset = 0; offset < signed_request_length;)
+    {
+        size_t remaining = signed_request_length - offset;
+        uint16_t fragment_length = (uint16_t)(remaining >
+                                               RADIO_DH_RSA_FRAGMENT_DATA_SIZE
+                                                   ? RADIO_DH_RSA_FRAGMENT_DATA_SIZE
+                                                   : remaining);
+        uint8_t fragment_data[RADIO_MAX_DATA];
+        radio_write_u16_be(fragment_data,
+                           (uint16_t)signed_request_length);
+        radio_write_u16_be(&fragment_data[2], (uint16_t)offset);
+        memcpy(&fragment_data[RADIO_DH_RSA_FRAGMENT_HEADER_SIZE],
+               &signed_request[offset],
+               fragment_length);
+
+        radio_packet_t packet;
+        if (!radio_packet_create(&packet,
+                                 source,
+                                 destination,
+                                 command,
+                                 RADIO_FLAG_ACK_REQUEST | RADIO_FLAG_FRAGMENT,
+                                 sequence) ||
+            !radio_packet_set_path(&packet, route, route_length) ||
+            !radio_packet_set_data(&packet,
+                                   fragment_data,
+                                   (uint16_t)(RADIO_DH_RSA_FRAGMENT_HEADER_SIZE +
+                                              fragment_length)) ||
+            !radio_send_packet(device,
+                               &packet,
+                               first_hop_local_address,
+                               0))
+            return false;
+
+        offset += fragment_length;
+    }
+
+    return true;
 }
 
 
@@ -1601,6 +1954,498 @@ bool Respond_To_RSA_Key_Relay(uint32_t global_address,
     return sent;
 }
 
+bool Respond_To_DH_Exchange_Request(uint32_t global_address,
+                                    e32_t *radio_device,
+                                    ftp_client_t *ftp,
+                                    const radio_packet_t *request,
+                                    mpz_t private_rsa_exponent,
+                                    mpz_t rsa_modulus,
+                                    mpz_t shared_secret)
+{
+    if (radio_device == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_SEND_ENCRYPTION_REQUEST ||
+        request->path_length < 2 ||
+        request->path_length > RADIO_MAX_ROUTE_ADDRESSES ||
+        request->path[0] != request->source ||
+        request->path[request->path_length - 1u] != global_address ||
+        request->destination != global_address ||
+        (request->flags & RADIO_FLAG_FRAGMENT) == 0 ||
+        request->length <= RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
+        return false;
+
+    uint16_t total_length = radio_read_u16_be_value(request->data);
+    uint16_t offset = radio_read_u16_be_value(&request->data[2]);
+    size_t fragment_length = request->length -
+                             RADIO_DH_RSA_FRAGMENT_HEADER_SIZE;
+    if (total_length != RADIO_DH_SIGNED_REQUEST_SIZE ||
+        offset > total_length ||
+        fragment_length > total_length - offset)
+        return false;
+
+    if (dh_request_completed_valid &&
+        dh_request_completed_source == request->source &&
+        dh_request_completed_sequence == request->sequence)
+        return true;
+
+    if (!dh_request_reassembly_active ||
+        dh_request_reassembly_source != request->source ||
+        dh_request_reassembly_sequence != request->sequence)
+    {
+        if (offset != 0)
+            return false;
+        dh_request_reassembly_source = request->source;
+        dh_request_reassembly_sequence = request->sequence;
+        dh_request_reassembly_length = 0;
+        dh_request_reassembly_active = true;
+    }
+
+    if (offset != dh_request_reassembly_length)
+        return false;
+
+    memcpy(&dh_request_reassembly[offset],
+           &request->data[RADIO_DH_RSA_FRAGMENT_HEADER_SIZE],
+           fragment_length);
+    dh_request_reassembly_length += fragment_length;
+    if (dh_request_reassembly_length < total_length)
+        return true;
+
+    dh_request_reassembly_active = false;
+    mpz_set_ui(shared_secret, 0);
+
+    const uint8_t *message = dh_request_reassembly;
+    const uint8_t *signature =
+        &dh_request_reassembly[RADIO_DH_MESSAGE_SIZE];
+    uint8_t signature_input[RADIO_DH_SIGNATURE_INPUT_MAX_SIZE];
+    radio_build_dh_signature_input(RADIO_CMD_SEND_ENCRYPTION_REQUEST,
+                                   request->source,
+                                   global_address,
+                                   request->sequence,
+                                   message,
+                                   RADIO_DH_MESSAGE_SIZE,
+                                   signature_input);
+
+    mpz_t sender_public_exponent;
+    mpz_t sender_rsa_modulus;
+    mpz_t dh_modulus;
+    mpz_t sender_dh_number;
+    mpz_t receiver_private_number;
+    mpz_t receiver_dh_number;
+    mpz_t generator;
+    mpz_t derived_secret;
+    mpz_init(sender_public_exponent);
+    mpz_init(sender_rsa_modulus);
+    mpz_init(dh_modulus);
+    mpz_init(sender_dh_number);
+    mpz_init(receiver_private_number);
+    mpz_init(receiver_dh_number);
+    mpz_init(generator);
+    mpz_init(derived_secret);
+
+    bool success = false;
+    if (!radio_load_rsa_public_key(ftp,
+                                   request->source,
+                                   sender_public_exponent,
+                                   sender_rsa_modulus) ||
+        !radio_rsa_verify_sha256(signature_input,
+                                 RADIO_DH_SIGNATURE_CONTEXT_SIZE +
+                                     RADIO_DH_MESSAGE_SIZE,
+                                 signature,
+                                 sender_public_exponent,
+                                 sender_rsa_modulus))
+    {
+        printf("Encryption request signature is invalid\n");
+        goto cleanup_dh_request;
+    }
+
+    radio_import_mpz_fixed(dh_modulus, message, RADIO_DH_FIELD_SIZE);
+    radio_import_mpz_fixed(sender_dh_number,
+                           &message[RADIO_DH_FIELD_SIZE],
+                           RADIO_DH_FIELD_SIZE);
+    if (mpz_sizeinbase(dh_modulus, 2) != RADIO_DH_MODULUS_BITS ||
+        mpz_even_p(dh_modulus) ||
+        mpz_probab_prime_p(dh_modulus, 8) == 0 ||
+        mpz_cmp_ui(sender_dh_number, 1) <= 0 ||
+        mpz_cmp(sender_dh_number, dh_modulus) >= 0)
+    {
+        printf("Encryption request contains invalid DH parameters\n");
+        goto cleanup_dh_request;
+    }
+
+    mpz_set_ui(generator, 2);
+    DH_Generate_Private_Number(receiver_private_number);
+    DH_Generate_Sending_Number(receiver_dh_number,
+                               generator,
+                               dh_modulus,
+                               receiver_private_number);
+    DH_Shared_Secret(derived_secret,
+                     sender_dh_number,
+                     dh_modulus,
+                     receiver_private_number);
+
+        uint8_t response_message[RADIO_DH_RESPONSE_MESSAGE_SIZE];
+        uint8_t shared_secret_bytes[RADIO_DH_FIELD_SIZE];
+        uint8_t response_hash[RADIO_DH_HASH_SIZE];
+        if (!radio_export_mpz_fixed(receiver_dh_number,
+                        response_message,
+                        RADIO_DH_FIELD_SIZE) ||
+         !radio_export_mpz_fixed(derived_secret,
+                        shared_secret_bytes,
+                        RADIO_DH_FIELD_SIZE))
+        goto cleanup_dh_request;
+        sha256_hash(shared_secret_bytes,
+              sizeof(shared_secret_bytes),
+              response_hash);
+        memcpy(&response_message[RADIO_DH_FIELD_SIZE],
+            response_hash,
+            sizeof(response_hash));
+
+    uint32_t response_route[RADIO_MAX_ROUTE_ADDRESSES];
+    for (uint8_t i = 0; i < request->path_length; ++i)
+        response_route[i] = request->path[request->path_length - i - 1u];
+
+    uint16_t first_hop_local_address;
+    if (!radio_find_neighbor_local_address(ftp,
+                                           response_route[1],
+                                           &first_hop_local_address))
+    {
+        printf("No local radio address for response next hop %08lX\n",
+               (unsigned long)response_route[1]);
+        goto cleanup_dh_request;
+    }
+
+    uint8_t response_signature[RADIO_DH_SIGNATURE_SIZE];
+    radio_build_dh_signature_input(RADIO_CMD_SEND_ENCRYPTION_RESPONSE,
+                                   global_address,
+                                   request->source,
+                                   request->sequence,
+                                   response_message,
+                                   sizeof(response_message),
+                                   signature_input);
+    if (!radio_rsa_sign_sha256(signature_input,
+                               RADIO_DH_SIGNATURE_CONTEXT_SIZE +
+                                   sizeof(response_message),
+                               private_rsa_exponent,
+                               rsa_modulus,
+                               response_signature) ||
+        !radio_send_dh_signed_message(radio_device,
+                                      global_address,
+                                      request->source,
+                                      response_route,
+                                      request->path_length,
+                                      first_hop_local_address,
+                                      RADIO_CMD_SEND_ENCRYPTION_RESPONSE,
+                                      request->sequence,
+                                      response_message,
+                                      sizeof(response_message),
+                                      response_signature))
+    {
+        printf("Failed to send signed DH response\n");
+        goto cleanup_dh_request;
+    }
+
+    dh_request_completed_source = request->source;
+    dh_request_completed_sequence = request->sequence;
+    dh_request_completed_valid = true;
+    mpz_set(shared_secret, derived_secret);
+    dh_responder_pending_source = request->source;
+    dh_responder_pending_sequence = request->sequence;
+    dh_responder_pending_active = true;
+    success = true;
+
+cleanup_dh_request:
+    mpz_clear(sender_public_exponent);
+    mpz_clear(sender_rsa_modulus);
+    mpz_clear(dh_modulus);
+    mpz_clear(sender_dh_number);
+    mpz_clear(receiver_private_number);
+    mpz_clear(receiver_dh_number);
+    mpz_clear(generator);
+    mpz_clear(derived_secret);
+    return success;
+}
+
+
+static bool radio_send_dh_exchange_result(e32_t *radio_device,
+                                          uint32_t source,
+                                          uint32_t destination,
+                                          const uint32_t *route,
+                                          uint8_t route_length,
+                                          uint16_t first_hop_local_address,
+                                          uint16_t command,
+                                          uint16_t sequence,
+                                          mpz_t private_rsa_exponent,
+                                          mpz_t rsa_modulus)
+{
+    uint8_t signature_input[RADIO_DH_SIGNATURE_CONTEXT_SIZE];
+    uint8_t signature[RADIO_DH_SIGNATURE_SIZE];
+    radio_build_dh_signature_input(command,
+                                   source,
+                                   destination,
+                                   sequence,
+                                   NULL,
+                                   0,
+                                   signature_input);
+    if (!radio_rsa_sign_sha256(signature_input,
+                               sizeof(signature_input),
+                               private_rsa_exponent,
+                               rsa_modulus,
+                               signature))
+        return false;
+
+    radio_packet_t result;
+    return radio_packet_create(&result,
+                               source,
+                               destination,
+                               command,
+                               0,
+                               sequence) &&
+           radio_packet_set_path(&result, route, route_length) &&
+           radio_packet_set_data(&result, signature, sizeof(signature)) &&
+           radio_send_packet(radio_device,
+                             &result,
+                             first_hop_local_address,
+                             0);
+}
+
+
+bool Respond_To_DH_Exchange_Response(uint32_t global_address,
+                                     e32_t *radio_device,
+                                     ftp_client_t *ftp,
+                                     const radio_packet_t *response,
+                                     mpz_t private_rsa_exponent,
+                                     mpz_t rsa_modulus,
+                                     mpz_t shared_secret)
+{
+    if (radio_device == NULL || ftp == NULL || response == NULL ||
+        !dh_pending_active ||
+        response->command != RADIO_CMD_SEND_ENCRYPTION_RESPONSE ||
+        response->source != dh_pending_destination ||
+        response->destination != global_address ||
+        global_address != dh_pending_source ||
+        response->sequence != dh_pending_sequence ||
+        response->path_length < 2 ||
+        response->path_length > RADIO_MAX_ROUTE_ADDRESSES ||
+        response->path[0] != response->source ||
+        response->path[response->path_length - 1u] != global_address ||
+        (response->flags & RADIO_FLAG_FRAGMENT) == 0 ||
+        response->length <= RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
+        return false;
+
+    uint16_t total_length = radio_read_u16_be_value(response->data);
+    uint16_t offset = radio_read_u16_be_value(&response->data[2]);
+    size_t fragment_length = response->length -
+                             RADIO_DH_RSA_FRAGMENT_HEADER_SIZE;
+    if (total_length != RADIO_DH_SIGNED_RESPONSE_SIZE ||
+        offset > total_length ||
+        fragment_length > total_length - offset)
+        return false;
+
+    if (!dh_response_reassembly_active ||
+        dh_response_reassembly_source != response->source ||
+        dh_response_reassembly_sequence != response->sequence)
+    {
+        if (offset != 0)
+            return false;
+        dh_response_reassembly_source = response->source;
+        dh_response_reassembly_sequence = response->sequence;
+        dh_response_reassembly_length = 0;
+        dh_response_reassembly_active = true;
+    }
+
+    if (offset != dh_response_reassembly_length)
+        return false;
+
+    memcpy(&dh_response_reassembly[offset],
+           &response->data[RADIO_DH_RSA_FRAGMENT_HEADER_SIZE],
+           fragment_length);
+    dh_response_reassembly_length += fragment_length;
+    if (dh_response_reassembly_length < total_length)
+        return true;
+    dh_response_reassembly_active = false;
+
+    mpz_set_ui(shared_secret, 0);
+    const uint8_t *message = dh_response_reassembly;
+    const uint8_t *signature =
+        &dh_response_reassembly[RADIO_DH_RESPONSE_MESSAGE_SIZE];
+    uint8_t signature_input[RADIO_DH_SIGNATURE_INPUT_MAX_SIZE];
+    radio_build_dh_signature_input(RADIO_CMD_SEND_ENCRYPTION_RESPONSE,
+                                   response->source,
+                                   global_address,
+                                   response->sequence,
+                                   message,
+                                   RADIO_DH_RESPONSE_MESSAGE_SIZE,
+                                   signature_input);
+
+    uint32_t result_route[RADIO_MAX_ROUTE_ADDRESSES];
+    for (uint8_t i = 0; i < response->path_length; ++i)
+        result_route[i] = response->path[response->path_length - i - 1u];
+
+    uint16_t first_hop_local_address;
+    bool route_available = radio_find_neighbor_local_address(
+        ftp,
+        result_route[1],
+        &first_hop_local_address);
+
+    mpz_t sender_public_exponent;
+    mpz_t sender_rsa_modulus;
+    mpz_t dh_modulus;
+    mpz_t private_number;
+    mpz_t peer_dh_number;
+    mpz_t derived_secret;
+    mpz_init(sender_public_exponent);
+    mpz_init(sender_rsa_modulus);
+    mpz_init(dh_modulus);
+    mpz_init(private_number);
+    mpz_init(peer_dh_number);
+    mpz_init(derived_secret);
+
+    bool matched = false;
+    if (route_available &&
+        radio_load_rsa_public_key(ftp,
+                                  response->source,
+                                  sender_public_exponent,
+                                  sender_rsa_modulus) &&
+        radio_rsa_verify_sha256(signature_input,
+                                RADIO_DH_SIGNATURE_CONTEXT_SIZE +
+                                    RADIO_DH_RESPONSE_MESSAGE_SIZE,
+                                signature,
+                                sender_public_exponent,
+                                sender_rsa_modulus))
+    {
+        radio_import_mpz_fixed(dh_modulus,
+                               dh_pending_modulus,
+                               sizeof(dh_pending_modulus));
+        radio_import_mpz_fixed(private_number,
+                               dh_pending_private,
+                               sizeof(dh_pending_private));
+        radio_import_mpz_fixed(peer_dh_number,
+                               message,
+                               RADIO_DH_FIELD_SIZE);
+
+        if (mpz_cmp_ui(peer_dh_number, 1) > 0 &&
+            mpz_cmp(peer_dh_number, dh_modulus) < 0)
+        {
+            DH_Shared_Secret(derived_secret,
+                             peer_dh_number,
+                             dh_modulus,
+                             private_number);
+
+            uint8_t secret_bytes[RADIO_DH_FIELD_SIZE];
+            uint8_t calculated_hash[RADIO_DH_HASH_SIZE];
+            if (radio_export_mpz_fixed(derived_secret,
+                                       secret_bytes,
+                                       sizeof(secret_bytes)))
+            {
+                sha256_hash(secret_bytes,
+                            sizeof(secret_bytes),
+                            calculated_hash);
+                matched = memcmp(calculated_hash,
+                                 &message[RADIO_DH_FIELD_SIZE],
+                                 RADIO_DH_HASH_SIZE) == 0;
+            }
+        }
+    }
+
+    uint16_t result_command = matched
+                                  ? RADIO_CMD_DH_EXCHANGE_CONFIRMED
+                                  : RADIO_CMD_DH_EXCHANGE_FAILED;
+    bool result_sent = route_available &&
+        radio_send_dh_exchange_result(radio_device,
+                                      global_address,
+                                      response->source,
+                                      result_route,
+                                      response->path_length,
+                                      first_hop_local_address,
+                                      result_command,
+                                      response->sequence,
+                                      private_rsa_exponent,
+                                      rsa_modulus);
+
+    bool success = matched && result_sent;
+    if (success)
+    {
+        mpz_set(shared_secret, derived_secret);
+    }
+    else if (!matched)
+    {
+        printf("DH exchange verification failed with %08lX\n",
+               (unsigned long)response->source);
+    }
+
+    if (result_sent)
+    {
+        dh_pending_active = false;
+        memset(dh_pending_private, 0, sizeof(dh_pending_private));
+        memset(dh_pending_modulus, 0, sizeof(dh_pending_modulus));
+    }
+
+    mpz_clear(sender_public_exponent);
+    mpz_clear(sender_rsa_modulus);
+    mpz_clear(dh_modulus);
+    mpz_clear(private_number);
+    mpz_clear(peer_dh_number);
+    mpz_clear(derived_secret);
+    return success;
+}
+
+
+bool Respond_To_DH_Exchange_Result(uint32_t global_address,
+                                   ftp_client_t *ftp,
+                                   const radio_packet_t *result)
+{
+    if (ftp == NULL || result == NULL ||
+        (result->command != RADIO_CMD_DH_EXCHANGE_CONFIRMED &&
+         result->command != RADIO_CMD_DH_EXCHANGE_FAILED) ||
+        !dh_responder_pending_active ||
+        result->source != dh_responder_pending_source ||
+        result->destination != global_address ||
+        result->sequence != dh_responder_pending_sequence ||
+        result->path_length < 2 ||
+        result->path_length > RADIO_MAX_ROUTE_ADDRESSES ||
+        result->path[0] != result->source ||
+        result->path[result->path_length - 1u] != global_address ||
+        result->length != RADIO_DH_SIGNATURE_SIZE)
+        return false;
+
+    mpz_t sender_public_exponent;
+    mpz_t sender_rsa_modulus;
+    mpz_init(sender_public_exponent);
+    mpz_init(sender_rsa_modulus);
+
+    uint8_t signature_input[RADIO_DH_SIGNATURE_CONTEXT_SIZE];
+    radio_build_dh_signature_input(result->command,
+                                   result->source,
+                                   global_address,
+                                   result->sequence,
+                                   NULL,
+                                   0,
+                                   signature_input);
+    bool valid = radio_load_rsa_public_key(ftp,
+                                           result->source,
+                                           sender_public_exponent,
+                                           sender_rsa_modulus) &&
+                 radio_rsa_verify_sha256(signature_input,
+                                         sizeof(signature_input),
+                                         result->data,
+                                         sender_public_exponent,
+                                         sender_rsa_modulus);
+    mpz_clear(sender_public_exponent);
+    mpz_clear(sender_rsa_modulus);
+    if (!valid)
+        return false;
+
+    if (result->command == RADIO_CMD_DH_EXCHANGE_CONFIRMED)
+        printf("DH exchange confirmed with %08lX\n",
+               (unsigned long)result->source);
+    else
+        printf("DH exchange failed with %08lX\n",
+               (unsigned long)result->source);
+
+    dh_responder_pending_active = false;
+    return true;
+}
+
+
 bool Respond_To_Local_Address(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -1611,7 +2456,10 @@ bool Respond_To_Local_Address(uint32_t global_address,
 bool Handle_Radio_Packet(uint32_t global_address,
                          e32_t *radio,
                          ftp_client_t *ftp,
-                         const radio_packet_t *packet)
+                         const radio_packet_t *packet,
+                         mpz_t private_rsa_exponent,
+                         mpz_t rsa_modulus,
+                         mpz_t shared_secret)
 {
     if (packet == NULL)
         return false;
@@ -1662,6 +2510,34 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                         radio,
                                         ftp,
                                         packet);
+    }
+
+    if (packet->command == RADIO_CMD_SEND_ENCRYPTION_REQUEST)
+    {
+        return Respond_To_DH_Exchange_Request(global_address,
+                                              radio,
+                                              ftp,
+                                              packet,
+                                              private_rsa_exponent,
+                                              rsa_modulus,
+                                              shared_secret);
+    }
+
+    if (packet->command == RADIO_CMD_SEND_ENCRYPTION_RESPONSE)
+    {
+        return Respond_To_DH_Exchange_Response(global_address,
+                                               radio,
+                                               ftp,
+                                               packet,
+                                               private_rsa_exponent,
+                                               rsa_modulus,
+                                               shared_secret);
+    }
+
+    if (packet->command == RADIO_CMD_DH_EXCHANGE_CONFIRMED ||
+        packet->command == RADIO_CMD_DH_EXCHANGE_FAILED)
+    {
+        return Respond_To_DH_Exchange_Result(global_address, ftp, packet);
     }
 
     return false;
@@ -2012,7 +2888,9 @@ bool Create_DH_Exchange_Packet(uint32_t target_global_address,
         *route_length > RADIO_MAX_ROUTE_ADDRESSES ||
         route[0] != personal_global_address ||
         route[*route_length - 1u] != target_global_address ||
-        mpz_sgn(private_rsa_exponent) <= 0 || mpz_sgn(rsa_modulus) <= 0)
+        dh_pending_active ||
+        mpz_sgn(private_rsa_exponent) <= 0 ||
+        mpz_sizeinbase(rsa_modulus, 2) != RADIO_RSA_PUBLIC_MODULUS_BITS)
         return false;
 
     mpz_t private_number;
@@ -2021,8 +2899,6 @@ bool Create_DH_Exchange_Packet(uint32_t target_global_address,
     mpz_t random_number;
     mpz_t seed;
     mpz_t generator;
-    mpz_t packed_message;
-    mpz_t cipher_text;
 
     mpz_init(private_number);
     mpz_init(sending_number);
@@ -2030,11 +2906,10 @@ bool Create_DH_Exchange_Packet(uint32_t target_global_address,
     mpz_init(random_number);
     mpz_init(seed);
     mpz_init(generator);
-    mpz_init(packed_message);
-    mpz_init(cipher_text);
 
     bool success = false;
-    uint8_t cipher_bytes[RADIO_DH_RSA_CIPHERTEXT_MAX_SIZE];
+    uint8_t message[RADIO_DH_MESSAGE_SIZE];
+    uint8_t signed_request[RADIO_DH_SIGNED_REQUEST_SIZE];
 
     do
     {
@@ -2046,7 +2921,7 @@ bool Create_DH_Exchange_Packet(uint32_t target_global_address,
         mpz_setbit(random_number, RADIO_DH_MODULUS_BITS - 1u);
         mpz_setbit(random_number, 0);
         generate_random_prime_number(random_number, modulus);
-    } while (mpz_sizeinbase(modulus, 2) > RADIO_DH_MODULUS_BITS);
+    } while (mpz_sizeinbase(modulus, 2) != RADIO_DH_MODULUS_BITS);
 
     mpz_set_ui(generator, 2);
     DH_Generate_Private_Number(private_number);
@@ -2055,94 +2930,58 @@ bool Create_DH_Exchange_Packet(uint32_t target_global_address,
                                modulus,
                                private_number);
 
-    if (mpz_sgn(sending_number) < 0 ||
-        mpz_sizeinbase(sending_number, 2) > RADIO_DH_MODULUS_BITS)
+    if (mpz_cmp_ui(sending_number, 1) <= 0 ||
+        mpz_cmp(sending_number, modulus) >= 0 ||
+        !radio_export_mpz_fixed(modulus, message, RADIO_DH_FIELD_SIZE) ||
+        !radio_export_mpz_fixed(sending_number,
+                                &message[RADIO_DH_FIELD_SIZE],
+                                RADIO_DH_FIELD_SIZE) ||
+        !radio_export_mpz_fixed(private_number,
+                                dh_pending_private,
+                                sizeof(dh_pending_private)) ||
+        !radio_export_mpz_fixed(modulus,
+                                dh_pending_modulus,
+                                sizeof(dh_pending_modulus)))
         goto cleanup;
-
-    mpz_mul_2exp(packed_message, modulus, RADIO_DH_MODULUS_BITS);
-    mpz_add(packed_message, packed_message, sending_number);
-
-    if (mpz_cmp(packed_message, rsa_modulus) >= 0)
-    {
-        printf("RSA modulus is too small for the packed DH values\n");
-        goto cleanup;
-    }
-
-    RSA_encrypt(packed_message,
-                private_rsa_exponent,
-                rsa_modulus,
-                cipher_text);
-
-    size_t cipher_length = (mpz_sizeinbase(rsa_modulus, 2) + 7u) / 8u;
-    if (cipher_length == 0 ||
-        cipher_length > sizeof(cipher_bytes))
-    {
-        printf("RSA ciphertext exceeds the supported fragment limit\n");
-        goto cleanup;
-    }
-
-    memset(cipher_bytes, 0, sizeof(cipher_bytes));
-    size_t exported_length = 0;
-    mpz_export(cipher_bytes,
-               &exported_length,
-               1,
-               1,
-               1,
-               0,
-               cipher_text);
-    if (exported_length > cipher_length)
-        goto cleanup;
-
-    if (exported_length < cipher_length)
-    {
-        memmove(&cipher_bytes[cipher_length - exported_length],
-                cipher_bytes,
-                exported_length);
-        memset(cipher_bytes, 0, cipher_length - exported_length);
-    }
 
     static uint16_t sequence;
     ++sequence;
-    for (size_t offset = 0; offset < cipher_length;)
+    uint8_t signature_input[RADIO_DH_SIGNATURE_INPUT_MAX_SIZE];
+    radio_build_dh_signature_input(RADIO_CMD_SEND_ENCRYPTION_REQUEST,
+                                   personal_global_address,
+                                   target_global_address,
+                                   sequence,
+                                   message,
+                                   sizeof(message),
+                                   signature_input);
+    if (!radio_rsa_sign_sha256(signature_input,
+                               RADIO_DH_SIGNATURE_CONTEXT_SIZE +
+                                   sizeof(message),
+                               private_rsa_exponent,
+                               rsa_modulus,
+                               &signed_request[RADIO_DH_MESSAGE_SIZE]))
+        goto cleanup;
+
+    memcpy(signed_request, message, sizeof(message));
+
+    success = radio_send_dh_signed_message(&radio,
+                                           personal_global_address,
+                                           target_global_address,
+                                           route,
+                                           *route_length,
+                                           first_hop_local_address,
+                                           RADIO_CMD_SEND_ENCRYPTION_REQUEST,
+                                           sequence,
+                                           message,
+                                           sizeof(message),
+                                           &signed_request[RADIO_DH_MESSAGE_SIZE]);
+    if (success)
     {
-        size_t remaining = cipher_length - offset;
-        uint16_t fragment_length = (uint16_t)(remaining >
-                                               RADIO_DH_RSA_FRAGMENT_DATA_SIZE
-                                                   ? RADIO_DH_RSA_FRAGMENT_DATA_SIZE
-                                                   : remaining);
-        uint8_t fragment_data[RADIO_MAX_DATA];
-        radio_write_u16_be(fragment_data, (uint16_t)cipher_length);
-        radio_write_u16_be(&fragment_data[2], (uint16_t)offset);
-        memcpy(&fragment_data[RADIO_DH_RSA_FRAGMENT_HEADER_SIZE],
-               &cipher_bytes[offset],
-               fragment_length);
-
-        radio_packet_t packet;
-        if (!radio_packet_create(&packet,
-                                 personal_global_address,
-                                 target_global_address,
-                                 RADIO_CMD_SEND_ENCRYPTION_REQUEST,
-                                 RADIO_FLAG_ACK_REQUEST | RADIO_FLAG_FRAGMENT,
-                                 sequence) ||
-            !radio_packet_set_path(&packet, route, *route_length) ||
-            !radio_packet_set_data(&packet,
-                                   fragment_data,
-                                   (uint16_t)(RADIO_DH_RSA_FRAGMENT_HEADER_SIZE +
-                                              fragment_length)) ||
-            !radio_send_packet(&radio,
-                               &packet,
-                               first_hop_local_address,
-                               0))
-        {
-            printf("Failed to send encryption request to %08lX\n",
-                   (unsigned long)target_global_address);
-            goto cleanup;
-        }
-
-        offset += fragment_length;
+        dh_pending_source = personal_global_address;
+        dh_pending_destination = target_global_address;
+        dh_pending_sequence = sequence;
+        dh_pending_active = true;
     }
-
-    success = true;
 
 cleanup:
     mpz_clear(private_number);
@@ -2151,7 +2990,5 @@ cleanup:
     mpz_clear(random_number);
     mpz_clear(seed);
     mpz_clear(generator);
-    mpz_clear(packed_message);
-    mpz_clear(cipher_text);
     return success;
 }
