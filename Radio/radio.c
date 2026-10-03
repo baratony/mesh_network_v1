@@ -40,7 +40,6 @@
     (RADIO_MAX_DATA - RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE)
 #define RADIO_GLOBAL_RSA_KEYS_RESPONSE_TIMEOUT_MS 10000
 #define RADIO_GLOBAL_RSA_KEYS_ATTEMPTS_PER_NEIGHBOR 2
-<<<<<<< HEAD
 #define RADIO_RSA_PUBLIC_MODULUS_BITS 2048
 #define RADIO_RSA_PUBLIC_MODULUS_SIZE (RADIO_RSA_PUBLIC_MODULUS_BITS / 8)
 #define RADIO_RSA_KEY_ROW_SIZE (sizeof(uint32_t) + RADIO_RSA_PUBLIC_MODULUS_SIZE)
@@ -62,8 +61,6 @@
 #define RADIO_DH_RSA_FRAGMENT_HEADER_SIZE 4u
 #define RADIO_DH_RSA_FRAGMENT_DATA_SIZE \
     (RADIO_MAX_DATA - RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
-=======
->>>>>>> refs/remotes/origin/main
 
 
 typedef struct
@@ -82,7 +79,6 @@ static bool global_connections_file_overflow;
 static uint8_t global_rsa_keys_file[RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE];
 static size_t global_rsa_keys_file_length;
 static bool global_rsa_keys_file_overflow;
-<<<<<<< HEAD
 static uint8_t dh_request_reassembly[RADIO_DH_SIGNED_REQUEST_SIZE];
 static size_t dh_request_reassembly_length;
 static uint32_t dh_request_reassembly_source;
@@ -111,8 +107,6 @@ static void radio_write_u16_be(uint8_t *data, uint16_t value);
 static void radio_write_u32_be(uint8_t *data, uint32_t value);
 static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
                                       uint8_t *neighbor_count);
-=======
->>>>>>> refs/remotes/origin/main
 
 
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
@@ -180,7 +174,6 @@ static uint32_t radio_crc32(const uint8_t *data, size_t length)
 }
 
 
-<<<<<<< HEAD
 static bool radio_rsa_key_address_saved(uint32_t global_address)
 {
     if (global_rsa_keys_file_length % RADIO_RSA_KEY_ROW_SIZE != 0)
@@ -238,8 +231,6 @@ static bool radio_valid_rsa_public_modulus(const uint8_t *modulus)
 }
 
 
-=======
->>>>>>> refs/remotes/origin/main
 static uint32_t radio_read_u32_be(const uint8_t *data)
 {
     return ((uint32_t)data[0] << 24) |
