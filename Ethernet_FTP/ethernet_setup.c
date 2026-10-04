@@ -12,12 +12,23 @@
 
 static ethernet_w5500_config_t w5500_config;
 
+#define HTTP_SOCKET 2
+#define HTTP_PORT 80
+
 static void ftp_data_cb(uint8_t *data, uint16_t len)
 {
     for (uint16_t i = 0; i < len; ++i) {
         putchar(data[i]);
     }
 }
+
+static const char http_response[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "<!doctype html><html><head><title>Pico Server</title></head>"
+    "<body><h1>Hello World!</h1><p>Served from a W5500</p></body></html>";
 
 static void wizchip_select(void)
 {
@@ -102,4 +113,54 @@ void init_w5500(const ethernet_w5500_config_t *config)
 
     ctlnetwork(CN_SET_NETINFO, &netinfo);
     printf("W5500 ready\n");
+
+    http_server_init();
+}
+
+void http_server_init(void)
+{
+    int8_t result = socket(HTTP_SOCKET, Sn_MR_TCP, HTTP_PORT, 0);
+    if (result < 0) {
+        printf("HTTP socket open failed: %d\n", result);
+        return;
+    }
+
+    if (listen(HTTP_SOCKET) != SOCK_OK) {
+        printf("HTTP socket listen failed\n");
+        return;
+    }
+
+    printf("HTTP server listening on port %u\n", HTTP_PORT);
+}
+
+void http_server_poll(void)
+{
+    switch (getSn_SR(HTTP_SOCKET)) {
+    case SOCK_ESTABLISHED:
+        if (getSn_RX_RSR(HTTP_SOCKET) > 0) {
+            uint8_t buffer[512];
+            int32_t received = recv(HTTP_SOCKET, buffer, sizeof(buffer));
+            if (received > 0) {
+                printf("HTTP request: %.*s\n", (int)received, (char *)buffer);
+                int32_t sent = send(HTTP_SOCKET, (uint8_t *)http_response,
+                                   sizeof(http_response) - 1);
+                if (sent <= 0) {
+                    printf("HTTP response send failed: %ld\n", (long)sent);
+                }
+                disconnect(HTTP_SOCKET);
+            }
+        }
+        break;
+
+    case SOCK_CLOSE_WAIT:
+        disconnect(HTTP_SOCKET);
+        break;
+
+    case SOCK_CLOSED:
+        http_server_init();
+        break;
+
+    default:
+        break;
+    }
 }

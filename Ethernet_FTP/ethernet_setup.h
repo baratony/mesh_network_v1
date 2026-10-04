@@ -25,6 +25,12 @@ typedef struct {
  */
 void init_w5500(const ethernet_w5500_config_t *config);
 
+/** Open the HTTP listener on port 80 using W5500 socket 2. */
+void http_server_init(void);
+
+/** Service one pending HTTP request; call regularly from the application loop. */
+void http_server_poll(void);
+
 #ifdef __cplusplus
 }
 #endif
