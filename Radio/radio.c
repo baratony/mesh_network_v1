@@ -33,6 +33,8 @@
 #define RADIO_GLOBAL_ROUTE_MAX_ADDRESSES 16
 #define RADIO_GLOBAL_CONNECTIONS_MAX_NODES \
     (RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE / sizeof(uint32_t))
+#define RADIO_NODE_REMOVAL_CACHE_SIZE \
+    (RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE / RADIO_GLOBAL_CONNECTIONS_ROW_SIZE)
 #define RADIO_GLOBAL_RSA_KEYS_FILE "global_rsa_key_list"
 #define RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE 16384
 #define RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE 12
@@ -79,6 +81,8 @@ static bool global_connections_file_overflow;
 static uint8_t global_rsa_keys_file[RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE];
 static size_t global_rsa_keys_file_length;
 static bool global_rsa_keys_file_overflow;
+static uint32_t radio_node_removal_cache[RADIO_NODE_REMOVAL_CACHE_SIZE];
+static size_t radio_node_removal_cache_next;
 static uint8_t dh_request_reassembly[RADIO_DH_SIGNED_REQUEST_SIZE];
 static size_t dh_request_reassembly_length;
 static uint32_t dh_request_reassembly_source;
@@ -689,6 +693,69 @@ static bool radio_add_connection_edge(uint32_t first_address,
     if (!radio_add_connection_to_row(first_row, second_address, changed))
         return false;
     return radio_add_connection_to_row(second_row, first_address, changed);
+}
+
+
+static bool radio_node_removal_seen(uint32_t global_address)
+{
+    for (size_t i = 0; i < RADIO_NODE_REMOVAL_CACHE_SIZE; ++i)
+    {
+        if (radio_node_removal_cache[i] == global_address)
+            return true;
+    }
+
+    return false;
+}
+
+
+static void radio_mark_node_removal_seen(uint32_t global_address)
+{
+    radio_node_removal_cache[radio_node_removal_cache_next] = global_address;
+    radio_node_removal_cache_next =
+        (radio_node_removal_cache_next + 1u) % RADIO_NODE_REMOVAL_CACHE_SIZE;
+}
+
+
+static bool radio_remove_global_connection_node(uint32_t global_address,
+                                                bool *changed)
+{
+    size_t row_count = global_connections_file_length /
+                       RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    size_t retained_rows = 0;
+
+    for (size_t row = 0; row < row_count; ++row)
+    {
+        size_t row_offset = row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+        uint32_t row_address = radio_read_global_connection_word(row_offset);
+        if (row_address == global_address)
+        {
+            *changed = true;
+            continue;
+        }
+
+        for (uint8_t column = 1; column < 9; ++column)
+        {
+            size_t word_offset = row_offset + column * sizeof(uint32_t);
+            if (radio_read_global_connection_word(word_offset) == global_address)
+            {
+                radio_write_global_connection_word(word_offset, 0);
+                *changed = true;
+            }
+        }
+
+        if (retained_rows != row)
+        {
+            memmove(&global_connections_file[
+                        retained_rows * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE],
+                    &global_connections_file[row_offset],
+                    RADIO_GLOBAL_CONNECTIONS_ROW_SIZE);
+        }
+        ++retained_rows;
+    }
+
+    global_connections_file_length =
+        retained_rows * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
+    return true;
 }
 
 
@@ -1603,6 +1670,67 @@ bool Find_Shortest_Global_Route(uint32_t source,
 }
 
 
+bool Relay_Node_Removal(uint32_t global_address,
+                        e32_t *radio,
+                        ftp_client_t *ftp)
+{
+    if (radio == NULL || ftp == NULL || global_address == 0)
+        return false;
+
+    if (radio_node_removal_seen(global_address))
+        return true;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    if (neighbor_file_length == 0)
+        return true;
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    ++sequence;
+    radio_mark_node_removal_seen(global_address);
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == global_address)
+            continue;
+
+        radio_packet_t request;
+        if (!radio_packet_create(&request,
+                                 global_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_RELAY_REMOVE_NODE,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 sequence) ||
+            !radio_send_packet(radio,
+                               &request,
+                               neighbors[i].local_address,
+                               0))
+        {
+            printf("Failed to request node removal from %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    return sent;
+}
+
+
 bool Relay_New_Node(uint32_t global_address,
                     e32_t *radio,
                     ftp_client_t *ftp)
@@ -2451,6 +2579,15 @@ bool Respond_To_Local_Address(uint32_t global_address,
                               ftp_client_t *ftp,
                               const radio_packet_t *request);
 
+bool Respond_To_Local_Address_Removal(uint32_t global_address,
+                                      e32_t *radio,
+                                      ftp_client_t *ftp,
+                                      const radio_packet_t *request);
+
+bool Respond_To_Node_Removal(uint32_t global_address,
+                             e32_t *radio,
+                             ftp_client_t *ftp,
+                             const radio_packet_t *request);
 
                               
 bool Handle_Radio_Packet(uint32_t global_address,
@@ -2480,6 +2617,14 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                         packet);
     }
 
+    if (packet->command == RADIO_CMD_REMOVE_LOCAL_ADDRESS)
+    {
+        return Respond_To_Local_Address_Removal(global_address,
+                                                radio,
+                                                ftp,
+                                                packet);
+    }
+
     if (packet->command == RADIO_CMD_RECEIVE_GLOBAL_CONNECTIONS)
     {
         return Respond_To_Global_Connections_Request(global_address,
@@ -2504,6 +2649,13 @@ bool Handle_Radio_Packet(uint32_t global_address,
                                    packet);
     }
 
+    if (packet->command == RADIO_CMD_RELAY_REMOVE_NODE)
+    {
+        return Respond_To_Node_Removal(global_address,
+                                       radio,
+                                       ftp,
+                                       packet);
+    }
     if (packet->command == RADIO_CMD_RELAY_RSA_KEYS)
     {
         return Respond_To_RSA_Key_Relay(global_address,
@@ -2576,6 +2728,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     } neighbor_t;
 
     static neighbor_t neighbors[8];
+
     static uint8_t neighbor_count = 0;
 
     absolute_time_t timeout =
@@ -2804,6 +2957,58 @@ bool Send_Local_Adress_To_Neighbors(uint32_t global_address,
     return sent;
 }
 
+bool Remove_Local_Address_From_Neighbors(uint32_t global_address,
+                                         e32_t *radio,
+                                         ftp_client_t *ftp)
+{
+    if (global_address == 0 || radio == NULL || ftp == NULL)
+        return false;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    if (neighbor_file_length == 0)
+        return true;
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    static uint16_t sequence;
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        radio_packet_t request;
+        if (!radio_packet_create(&request,
+                                 global_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_REMOVE_LOCAL_ADDRESS,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 ++sequence) ||
+            !radio_send_packet(radio,
+                               &request,
+                               neighbors[i].local_address,
+                               0))
+        {
+            printf("Failed to request neighbor removal from %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    return sent;
+}
+
 bool Respond_To_Local_Address(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -2872,6 +3077,158 @@ upload_neighbors:
                           output,
                           (uint32_t)output_length);
     }
+}
+
+bool Respond_To_Local_Address_Removal(uint32_t global_address,
+                                      e32_t *radio,
+                                      ftp_client_t *ftp,
+                                      const radio_packet_t *request)
+{
+    if (global_address == 0 || radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_REMOVE_LOCAL_ADDRESS ||
+        request->source == 0 || request->destination != global_address ||
+        request->length != 0)
+        return false;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (neighbor_file_length > 0 &&
+        !radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    uint8_t retained_count = 0;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address != request->source)
+            neighbors[retained_count++] = neighbors[i];
+    }
+
+    if (retained_count == neighbor_count)
+        return true;
+
+    uint8_t output[sizeof(neighbor_file)];
+    size_t output_length = 0;
+    for (uint8_t i = 0; i < retained_count; ++i)
+    {
+        int written = snprintf((char *)&output[output_length],
+                               sizeof(output) - output_length,
+                               "%08lX,%u\n",
+                               (unsigned long)neighbors[i].global_address,
+                               (unsigned int)neighbors[i].local_address);
+        if (written < 0 ||
+            (size_t)written >= sizeof(output) - output_length)
+            return false;
+
+        output_length += (size_t)written;
+    }
+
+    return ftp_upload(ftp,
+                      "local_neighbors.txt",
+                      output,
+                      (uint32_t)output_length);
+}
+
+
+bool Respond_To_Node_Removal(uint32_t global_address,
+                             e32_t *radio,
+                             ftp_client_t *ftp,
+                             const radio_packet_t *request)
+{
+    if (global_address == 0 || radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_RELAY_REMOVE_NODE ||
+        request->source == 0 || request->source == global_address ||
+        request->destination != global_address || request->length != 0)
+        return false;
+
+    uint32_t removed_address = request->source;
+    if (radio_node_removal_seen(removed_address))
+        return true;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow)
+    {
+        printf("FTP local_neighbors.txt download failed\n");
+        return false;
+    }
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+    if (neighbor_file_length > 0 &&
+        !radio_parse_neighbor_file(neighbors, &neighbor_count))
+    {
+        printf("No valid neighbors in local_neighbors.txt\n");
+        return false;
+    }
+
+    radio_mark_node_removal_seen(removed_address);
+
+    bool sent = true;
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        if (neighbors[i].global_address == removed_address ||
+            neighbors[i].global_address == global_address)
+            continue;
+
+        radio_packet_t relay;
+        if (!radio_packet_create(&relay,
+                                 removed_address,
+                                 neighbors[i].global_address,
+                                 RADIO_CMD_RELAY_REMOVE_NODE,
+                                 RADIO_FLAG_ACK_REQUEST,
+                                 request->sequence) ||
+            !radio_send_packet(radio,
+                               &relay,
+                               neighbors[i].local_address,
+                               0))
+        {
+            printf("Failed to relay node removal to %08lX\n",
+                   (unsigned long)neighbors[i].global_address);
+            sent = false;
+        }
+    }
+
+    radio_packet_t local_removal = *request;
+    local_removal.command = RADIO_CMD_REMOVE_LOCAL_ADDRESS;
+    bool local_removed = Respond_To_Local_Address_Removal(global_address,
+                                                          radio,
+                                                          ftp,
+                                                          &local_removal);
+
+    if (!radio_download_global_connections(ftp))
+    {
+        printf("FTP %s download failed or has an invalid format\n",
+               RADIO_GLOBAL_CONNECTIONS_FILE);
+        return false;
+    }
+
+    bool ledger_changed = false;
+    radio_remove_global_connection_node(removed_address, &ledger_changed);
+    if (ledger_changed &&
+        !ftp_upload(ftp,
+                    RADIO_GLOBAL_CONNECTIONS_FILE,
+                    global_connections_file,
+                    (uint32_t)global_connections_file_length))
+    {
+        printf("FTP upload of %s failed\n", RADIO_GLOBAL_CONNECTIONS_FILE);
+        ftp_disconnect(ftp);
+        return false;
+    }
+
+    return sent && local_removed;
 }
 
 e32_t radio;
