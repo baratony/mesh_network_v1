@@ -14,6 +14,34 @@
 extern "C" {
 #endif
 
+/* One entry of local_neighbors.txt: GLOBAL_ADDRESS,LOCAL_ADDRESS */
+typedef struct
+{
+    uint32_t global_address;
+    uint16_t local_address;
+} radio_neighbor_t;
+
+#define RADIO_NEIGHBOR_COUNT_MAX 8
+
+/*
+ * Parse the neighbour file that is currently held in the radio.c download
+ * buffer. Call radio_download_neighbor_file() first.
+ */
+bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
+                               uint8_t *neighbor_count);
+
+bool radio_download_neighbor_file(ftp_client_t *ftp);
+
+/*
+ * Returns true when local_neighbors.txt is missing, empty or contains no
+ * valid entry, i.e. this node has never joined the mesh before.
+ */
+bool radio_is_new_node(ftp_client_t *ftp);
+
+bool radio_find_neighbor_local_address(ftp_client_t *ftp,
+                                       uint32_t global_address,
+                                       uint16_t *local_address);
+
 uint16_t Generate_Local_Adress(uint32_t global_address,
                                e32_t *radio,
                                ftp_client_t *ftp);
@@ -25,8 +53,7 @@ bool Respond_To_Connections_Request(uint32_t global_address,
 
 bool Request_Global_Connections(uint32_t global_address,
                                 e32_t *radio,
-                                ftp_client_t *ftp,
-                                const radio_packet_t *request);
+                                ftp_client_t *ftp);
 
 bool Respond_To_Global_Connections_Request(uint32_t global_address,
                                           e32_t *radio,
@@ -45,10 +72,9 @@ bool Respond_To_Global_RSA_Keys_Request(uint32_t global_address,
 
 bool Find_Shortest_Global_Route(uint32_t source,
                                 uint32_t destination,
+                                ftp_client_t *ftp,
                                 uint32_t *path,
-                                uint8_t *path_length,
-                                const uint32_t *known_nodes,
-                                size_t known_node_count);
+                                uint8_t *path_length);
 
 bool Relay_Node_Removal(uint32_t global_address,
                         e32_t *radio,
@@ -56,8 +82,7 @@ bool Relay_Node_Removal(uint32_t global_address,
 
 bool Relay_New_Node(uint32_t global_address,
                     e32_t *radio,
-                    ftp_client_t *ftp,
-                    const radio_packet_t *request);
+                    ftp_client_t *ftp);
 
 bool Respond_To_New_Node(uint32_t global_address,
                         e32_t *radio,
@@ -65,9 +90,9 @@ bool Respond_To_New_Node(uint32_t global_address,
                         const radio_packet_t *request);
 
 bool Relay_RSA_Public_Key(uint32_t global_address,
+                         mpz_t public_modulo,
                          e32_t *radio,
-                         ftp_client_t *ftp,
-                         const radio_packet_t *request);
+                         ftp_client_t *ftp);
 
 bool Respond_To_RSA_Key_Relay(uint32_t global_address,
                              e32_t *radio,
@@ -85,7 +110,7 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
 bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                                      e32_t *radio_device,
                                      ftp_client_t *ftp,
-                                     const radio_packet_t *request,
+                                     const radio_packet_t *response,
                                      mpz_t private_rsa_exponent,
                                      mpz_t rsa_modulus,
                                      mpz_t shared_secret);

@@ -12,12 +12,11 @@
 #include "Ethernet_FTP/ethernet_setup.h"
 #include "Ethernet_FTP/ftp_client.h"
 #include "Cryptographic_Functions/Cryptographic_Functions.h"
-#include "Cryptographic_Functions/Cryptographic_Functions.c"
+#include "radio.h"
 
 
 
 #define RADIO_NEIGHBOR_FILE_MAX_SIZE 1024
-#define RADIO_NEIGHBOR_COUNT_MAX 8
 #define RADIO_CONNECTION_RECORD_SIZE 6
 #define RADIO_CONNECTIONS_PER_PACKET 8
 #define RADIO_CONNECTION_RESPONSE_TIMEOUT_MS 5000
@@ -65,13 +64,6 @@
     (RADIO_MAX_DATA - RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
 
 
-typedef struct
-{
-    uint32_t global_address;
-    uint16_t local_address;
-} radio_neighbor_t;
-
-
 static uint8_t neighbor_file[RADIO_NEIGHBOR_FILE_MAX_SIZE + 1];
 static size_t neighbor_file_length;
 static bool neighbor_file_overflow;
@@ -109,10 +101,6 @@ static bool dh_responder_pending_active;
 static uint32_t radio_read_u32_be(const uint8_t *data);
 static void radio_write_u16_be(uint8_t *data, uint16_t value);
 static void radio_write_u32_be(uint8_t *data, uint32_t value);
-static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
-                                      uint8_t *neighbor_count);
-
-
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
 {
     size_t available = sizeof(neighbor_file) - neighbor_file_length - 1;
@@ -463,7 +451,7 @@ static bool radio_load_rsa_public_key(ftp_client_t *ftp,
 }
 
 
-static bool radio_find_neighbor_local_address(ftp_client_t *ftp,
+bool radio_find_neighbor_local_address(ftp_client_t *ftp,
                                                uint32_t global_address,
                                                uint16_t *local_address)
 {
@@ -759,8 +747,8 @@ static bool radio_remove_global_connection_node(uint32_t global_address,
 }
 
 
-static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
-                                      uint8_t *neighbor_count)
+bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
+                               uint8_t *neighbor_count)
 {
     char *line = (char *)neighbor_file;
     char *end = (char *)neighbor_file + neighbor_file_length;
@@ -804,6 +792,39 @@ static bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
 
     *neighbor_count = count;
     return count > 0;
+}
+
+
+bool radio_download_neighbor_file(ftp_client_t *ftp)
+{
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+
+    if (ftp == NULL)
+        return false;
+
+    /* A missing file is the normal situation for a node that has never
+       joined the mesh, so a failed download means "brand new node". */
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb))
+        return false;
+
+    return !neighbor_file_overflow;
+}
+
+
+/*
+ * A node is brand new when it has no neighbour list on the FTP server:
+ * the file is missing, empty, or contains no valid "GLOBAL,LOCAL" entry.
+ */
+bool radio_is_new_node(ftp_client_t *ftp)
+{
+    if (!radio_download_neighbor_file(ftp))
+        return true;
+
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+
+    return !radio_parse_neighbor_file(neighbors, &neighbor_count);
 }
 
 
