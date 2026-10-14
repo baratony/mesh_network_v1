@@ -1,3 +1,41 @@
+/* ==========================================================================
+ * radio.c -- the MESH PROTOCOL layer.
+ *
+ * THE PROGRAM IN ONE PARAGRAPH
+ * ----------------------------
+ * Each Raspberry Pi Pico is a node. It can only talk physically to nodes in
+ * radio range, through an E32 broadcast radio with 16-bit addresses. The
+ * program's job is to turn that local, physical, unreliable channel into a
+ * global, reliable mesh: unique identities, a shared map of who-is-connected-
+ * to-whom, a shared table of public keys, and a shared secret per pair of
+ * nodes that want to exchange encrypted text.
+ *
+ * HOW THIS FILE FITS
+ * ------------------
+ *   mesh_network_v1.c  = the scheduler. Core 0 serves the HTML control panel,
+ *                        Core 1 receives packets and calls dispatch_packet().
+ *   radio_packet_protocol.c = framing: bytes <-> radio_packet_t.
+ *   radio.c (here)    = the meaning of each command. Every function here is
+ *                        either a REQUESTER (sends something on our behalf)
+ *                        or a RESPONDER (reacts to a packet we received).
+ *   Ethernet_FTP/     = the persistent storage. The node's whole idea of the
+ *                        mesh is a handful of files on an FTP server.
+ *   Cryptographic_Functions/ = mini-GMP bignum maths: RSA, DH, SHA-256,
+ *                        ChaCha20-Poly1305.
+ *
+ * THE THREE FILES THAT ARE THE NODE'S MEMORY
+ * ------------------------------------------
+ *   local_neighbors.txt      text: GLOBAL,LOCAL per line. Physical map.
+ *   global_connections.bin   rows of 9 uint32: [self, up to 8 neighbours].
+ *                            The map of the whole mesh.
+ *   global_rsa_key_list      rows of [4-byte global address | 256-byte modulus].
+ *                            Who can verify whose signature.
+ *   node_rsa_key.txt         this node's own modulus + private exponent.
+ *
+ * The static buffers at the top of this file are the in-RAM copies of those
+ * files. FTP callbacks fill them, handlers edit them in place, and ftp_upload
+ * writes them back. That is the whole data flow of the program.
+ * ==========================================================================*/
 #include "ebyte_e32.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,13 +54,24 @@
 
 
 
+/* --- local neighbour ledger ----------------------------------------------
+ * A neighbour record on the wire is its 4-byte global address + 2-byte local
+ * address = 6. Eight of them fit in one DATA packet, which is why the
+ * response timeout is sized for a single round trip of one neighbour. */
 #define RADIO_NEIGHBOR_FILE_MAX_SIZE 1024
 #define RADIO_CONNECTION_RECORD_SIZE 6
 #define RADIO_CONNECTIONS_PER_PACKET 8
 #define RADIO_CONNECTION_RESPONSE_TIMEOUT_MS 5000
+/* --- global connection graph ---------------------------------------------
+ * One row = the node itself plus up to 8 neighbours, all 32-bit global
+ * addresses, zero padded. Files are moved over the radio in RADIO_MAX_DATA
+ * sized chunks, hence the 8-byte chunk header [total length | offset]. */
 #define RADIO_GLOBAL_CONNECTIONS_FILE "global_connections.bin"
 #define RADIO_GLOBAL_CONNECTIONS_ROW_SIZE (9u * sizeof(uint32_t))
 #define RADIO_NEW_NODE_RECORD_SIZE (9u * sizeof(uint32_t))
+/* The 4 KiB cap is a RAM decision, not a protocol one: it bounds the graph
+ * to ~450 nodes and, together with RADIO_GLOBAL_ROUTE_MAX_JUMPS, keeps the
+ * breadth-first search in Find_Shortest_Global_Route stack-safe. */
 #define RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE 4096
 #define RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE 8
 #define RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE \
@@ -34,6 +83,11 @@
     (RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE / sizeof(uint32_t))
 #define RADIO_NODE_REMOVAL_CACHE_SIZE \
     (RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE / RADIO_GLOBAL_CONNECTIONS_ROW_SIZE)
+/* --- RSA public-key ledger -----------------------------------------------
+ * A row is 4 bytes of global address + the full 2048-bit modulus, so 16 KiB
+ * holds only 31 keys. The 12-byte chunk header adds a CRC-32 of the whole
+ * file: a half-received key list would silently break every signature check
+ * later, so it must be verified before being stored. */
 #define RADIO_GLOBAL_RSA_KEYS_FILE "global_rsa_key_list"
 #define RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE 16384
 #define RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE 12
@@ -41,6 +95,15 @@
     (RADIO_MAX_DATA - RADIO_GLOBAL_RSA_KEYS_CHUNK_HEADER_SIZE)
 #define RADIO_GLOBAL_RSA_KEYS_RESPONSE_TIMEOUT_MS 10000
 #define RADIO_GLOBAL_RSA_KEYS_ATTEMPTS_PER_NEIGHBOR 2
+/* --- crypto sizes --------------------------------------------------------
+ * RSA is done at full 2048-bit strength because the modulus doubles as the
+ * node's identity in the key ledger. The Diffie-Hellman modulus is much
+ * smaller (1023 bits) since it only has to hide a shared secret, and that
+ * secret is later truncated to a ChaCha20-Poly1305 key.
+ *
+ * The *_SIGNED_* sizes matter because a signature is as long as the whole
+ * RSA block: a DH message cannot fit one radio frame, which is exactly why
+ * the fragmenting helpers exist. */
 #define RADIO_RSA_PUBLIC_MODULUS_BITS 2048
 #define RADIO_RSA_PUBLIC_MODULUS_SIZE (RADIO_RSA_PUBLIC_MODULUS_BITS / 8)
 #define RADIO_RSA_KEY_ROW_SIZE (sizeof(uint32_t) + RADIO_RSA_PUBLIC_MODULUS_SIZE)
@@ -64,17 +127,44 @@
     (RADIO_MAX_DATA - RADIO_DH_RSA_FRAGMENT_HEADER_SIZE)
 
 
-static uint8_t neighbor_file[RADIO_NEIGHBOR_FILE_MAX_SIZE + 1];
+/* ==========================================================================
+ * THE NODE'S ENTIRE STATE, in RAM, mirroring the files on the FTP server.
+ *
+ * These are file-scope on purpose: the FTP API is callback based, so a
+ * download has to accumulate bytes into one of these buffers, and a handler
+ * then edits it in place and uploads it back. Only one Core 1 thread touches
+ * them, so no locking is needed here (the lock in main() protects the W5500,
+ * not these buffers).
+ * ==========================================================================*/
+static uint8_t neighbor_file[RADIO_NEIGHBOR_FILE_MAX_SIZE + 1]; /* +1 for the NUL terminator */
 static size_t neighbor_file_length;
-static bool neighbor_file_overflow;
+static bool neighbor_file_overflow; /* set when a download did not fit: treat the data as unusable */
+
 static uint8_t global_connections_file[RADIO_GLOBAL_CONNECTIONS_FILE_MAX_SIZE];
 static size_t global_connections_file_length;
 static bool global_connections_file_overflow;
 static uint8_t global_rsa_keys_file[RADIO_GLOBAL_RSA_KEYS_FILE_MAX_SIZE];
 static size_t global_rsa_keys_file_length;
 static bool global_rsa_keys_file_overflow;
+/* --- the removal wave ---------------------------------------------------
+ * A "node X left" announcement must travel the whole mesh but must not be
+ * bounced back and forth forever. This small ring remembers which removals
+ * this node has already processed, which is what makes the wave terminate. */
 static uint32_t radio_node_removal_cache[RADIO_NODE_REMOVAL_CACHE_SIZE];
 static size_t radio_node_removal_cache_next;
+/* --- the Diffie-Hellman exchange, spread over several packets -----------
+ * A DH message plus its RSA signature is ~512 bytes, larger than one radio
+ * frame, so it is split into fragments that may interleave with other
+ * traffic. These variables are the reassembly buffers, keyed by (source,
+ * sequence) so an interleaved packet from another exchange cannot corrupt
+ * the one in progress.
+ *
+ *   dh_request_*  -> we are the RECEIVER of an exchange (someone asked us)
+ *   dh_response_* -> we are the ORIGIN (we sent g^a and await the reply)
+ *   dh_pending_*  -> our own secret b and modulus, parked until the reply
+ *   dh_responder_pending_* -> the outcome packet we expect back from the
+ *                             node we answered
+ * ------------------------------------------------------------------------- */
 static uint8_t dh_request_reassembly[RADIO_DH_SIGNED_REQUEST_SIZE];
 static size_t dh_request_reassembly_length;
 static uint32_t dh_request_reassembly_source;
@@ -98,17 +188,26 @@ static uint32_t dh_responder_pending_source;
 static uint16_t dh_responder_pending_sequence;
 static bool dh_responder_pending_active;
 
+/* Forward declarations: the byte helpers are used by almost every function
+ * below, including ones defined before them. */
 static uint32_t radio_read_u32_be(const uint8_t *data);
 static void radio_write_u16_be(uint8_t *data, uint16_t value);
 static void radio_write_u32_be(uint8_t *data, uint32_t value);
+
+/* FTP download callback for local_neighbors.txt.
+ * ftp_download() hands us the file in pieces; this appends each piece to the
+ * static buffer and flags an overflow so a truncated file can be rejected
+ * rather than parsed half. */
 static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
 {
+    /* Keep one byte spare for the terminator, because the neighbour file is
+     * later parsed with C string functions (memchr/strchr/strtoul). */
     size_t available = sizeof(neighbor_file) - neighbor_file_length - 1;
 
     if (length > available)
     {
         length = (uint16_t)available;
-        neighbor_file_overflow = true;
+        neighbor_file_overflow = true; /* caller must refuse the whole file */
     }
 
     memcpy(&neighbor_file[neighbor_file_length], data, length);
@@ -116,7 +215,8 @@ static void radio_neighbor_file_cb(uint8_t *data, uint16_t length)
     neighbor_file[neighbor_file_length] = '\0';
 }
 
-
+/* Same pattern for global_connections.bin. Binary, so no terminator byte is
+ * reserved and the length is used as the exact size, never a NUL scan. */
 static void radio_global_connections_file_cb(uint8_t *data, uint16_t length)
 {
     size_t available = sizeof(global_connections_file) -
@@ -135,6 +235,7 @@ static void radio_global_connections_file_cb(uint8_t *data, uint16_t length)
 }
 
 
+/* Same pattern for global_rsa_key_list. */
 static void radio_global_rsa_keys_file_cb(uint8_t *data, uint16_t length)
 {
     size_t available = sizeof(global_rsa_keys_file) -
@@ -151,6 +252,10 @@ static void radio_global_rsa_keys_file_cb(uint8_t *data, uint16_t length)
 }
 
 
+/* CRC-32 (reflected, polynomial 0xEDB88320 - the standard zlib CRC).
+ * Used only on the RSA key ledger transfer, where a partial file would not
+ * be caught by the per-packet CRC-16: each packet is fine, the whole file is
+ * not. This is the integrity check for the *transfer*, not for one packet. */
 static uint32_t radio_crc32(const uint8_t *data, size_t length)
 {
     uint32_t crc = 0xFFFFFFFFu;
@@ -158,6 +263,7 @@ static uint32_t radio_crc32(const uint8_t *data, size_t length)
     for (size_t i = 0; i < length; ++i)
     {
         crc ^= data[i];
+        /* Branchless bit-at-a-time CRC: the mask is 0 or all-ones. */
         for (uint8_t bit = 0; bit < 8; ++bit)
             crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1u));
     }
@@ -165,12 +271,15 @@ static uint32_t radio_crc32(const uint8_t *data, size_t length)
     return ~crc;
 }
 
-
+/* Is this node's public key already in the ledger? Keeps the relay of a key
+ * finite: the first node that stores it stops the others from re-adding it. */
 static bool radio_rsa_key_address_saved(uint32_t global_address)
 {
+    /* A torn file must never be trusted, so a partial row means 'no'. */
     if (global_rsa_keys_file_length % RADIO_RSA_KEY_ROW_SIZE != 0)
         return false;
 
+    /* Walk row by row; the first 4 bytes of a row are its owner's address. */
     for (size_t offset = 0;
          offset < global_rsa_keys_file_length;
          offset += RADIO_RSA_KEY_ROW_SIZE)
@@ -182,10 +291,14 @@ static bool radio_rsa_key_address_saved(uint32_t global_address)
     return false;
 }
 
-
+/* Convert our bignum modulus into the fixed 256-byte big-endian block that
+ * goes on the wire. The left-pad is essential: mpz_export drops leading zero
+ * bytes, and without them the row offsets in the ledger would drift. */
 static bool radio_encode_rsa_public_modulus(mpz_t public_modulo,
                                             uint8_t output[RADIO_RSA_PUBLIC_MODULUS_SIZE])
 {
+    /* Reject anything that is not exactly 2048 bits: the row layout and the
+     * signature size both assume that exact width. */
     if (mpz_sgn(public_modulo) <= 0 ||
         mpz_sizeinbase(public_modulo, 2) != RADIO_RSA_PUBLIC_MODULUS_BITS)
         return false;
@@ -194,15 +307,17 @@ static bool radio_encode_rsa_public_modulus(mpz_t public_modulo,
     memset(output, 0, RADIO_RSA_PUBLIC_MODULUS_SIZE);
     mpz_export(output,
                &exported_length,
-               1,
-               1,
-               1,
-               0,
+               1,   /* one limb per word */
+               1,   /* most significant word first (big-endian) */
+               1,   /* one byte per word */
+               0,   /* no extra space at the start */
                public_modulo);
 
     if (exported_length > RADIO_RSA_PUBLIC_MODULUS_SIZE)
         return false;
 
+    /* mpz_export writes right-aligned into a buffer it thinks is big enough;
+     * slide the value to the right edge and clear the head. */
     if (exported_length < RADIO_RSA_PUBLIC_MODULUS_SIZE)
     {
         memmove(&output[RADIO_RSA_PUBLIC_MODULUS_SIZE - exported_length],
@@ -223,6 +338,9 @@ static bool radio_valid_rsa_public_modulus(const uint8_t *modulus)
 }
 
 
+/* --- byte helpers used by every binary format in this file --------------
+ * The wire is big-endian everywhere (see radio_packet_protocol.h), so these
+ * are the only conversions used anywhere in the protocol. */
 static uint32_t radio_read_u32_be(const uint8_t *data)
 {
     return ((uint32_t)data[0] << 24) |
@@ -237,7 +355,9 @@ static uint16_t radio_read_u16_be_value(const uint8_t *data)
     return (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
 }
 
-
+/* bignum -> fixed-size big-endian block. The mirror of
+ * radio_encode_rsa_public_modulus but for any size; used for the DH numbers
+ * and for the signatures. Returns false if the value would not fit. */
 static bool radio_export_mpz_fixed(mpz_t value, uint8_t *output, size_t length)
 {
     if (mpz_sgn(value) < 0 || output == NULL || length == 0 ||
@@ -260,6 +380,8 @@ static bool radio_export_mpz_fixed(mpz_t value, uint8_t *output, size_t length)
 }
 
 
+/* bytes -> bignum. Inverse of radio_export_mpz_fixed, used on every packet
+ * we receive: the wire is the only place a peer's numbers exist. */
 static void radio_import_mpz_fixed(mpz_t value,
                                    const uint8_t *input,
                                    size_t length)
@@ -268,10 +390,19 @@ static void radio_import_mpz_fixed(mpz_t value,
 }
 
 
+/* Build a PKCS#1 v1.5 'EMSA-PKCS1-v1_5' block for a SHA-256 digest.
+ *
+ * Why this matters: the node does not sign the raw message. It signs a
+ * standard, self-describing encoding of the message's hash. That is what
+ * makes the signature verifiable by any other node that knows only the
+ * public key, and it is why the same helper is used on both the signing and
+ * the verifying side. */
 static bool radio_build_rsa_sha256_digest_info(const uint8_t *data,
                                                 size_t data_length,
                                                 uint8_t encoded[RADIO_RSA_PUBLIC_MODULUS_SIZE])
 {
+    /* 0x00 0x01 then a run of 0xFF padding, a 0x00 separator, the DER
+     * prefix that says 'this is a SHA-256 digest', and the digest itself. */
     static const uint8_t digest_info_prefix[] = {
         0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
         0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20
@@ -298,6 +429,10 @@ static bool radio_build_rsa_sha256_digest_info(const uint8_t *data,
 }
 
 
+/* SIGN with this node's private key. Called every time a node sends something
+ * that must be attributable: a DH request/response and the outcome packets.
+ * RSA_encrypt() here is really 'modular exponentiation', used with d as the
+ * exponent, i.e. the private direction. */
 static bool radio_rsa_sign_sha256(const uint8_t *data,
                                  size_t data_length,
                                  mpz_t private_exponent,
@@ -317,6 +452,8 @@ static bool radio_rsa_sign_sha256(const uint8_t *data,
     bool success = radio_build_rsa_sha256_digest_info(data,
                                                        data_length,
                                                        encoded);
+    /* The message must be smaller than the modulus or the exponentiation
+     * would wrap around and the signature could not be verified. */
     if (success)
     {
         radio_import_mpz_fixed(encoded_message, encoded, sizeof(encoded));
@@ -341,6 +478,11 @@ static bool radio_rsa_sign_sha256(const uint8_t *data,
 }
 
 
+/* VERIFY with someone else's public key.
+ * The counterpart of the function above: it re-computes the expected block
+ * and compares it byte for byte with what the signature actually contained.
+ * This is the authentication gate of the whole mesh protocol - without it,
+ * any node could claim to be any other node. */
 static bool radio_rsa_verify_sha256(const uint8_t *data,
                                    size_t data_length,
                                    const uint8_t signature[RADIO_DH_SIGNATURE_SIZE],
@@ -422,6 +564,7 @@ static bool radio_load_rsa_public_key(ftp_client_t *ftp,
         global_rsa_keys_file_length % RADIO_RSA_KEY_ROW_SIZE != 0)
         return false;
 
+    /* Walk the ledger row by row looking for the owner's address. */
     for (size_t offset = 0;
          offset < global_rsa_keys_file_length;
          offset += RADIO_RSA_KEY_ROW_SIZE)
@@ -441,6 +584,9 @@ static bool radio_load_rsa_public_key(ftp_client_t *ftp,
             RADIO_RSA_PUBLIC_MODULUS_BITS)
             return false;
 
+        /* The public exponent is a constant for the whole project: every
+         * node uses e = 65537, so only the modulus has to be shared. That is
+         * what keeps the ledger at 260 bytes per node instead of two numbers. */
         mpz_set_ui(public_exponent, 65537u);
         return true;
     }
@@ -451,6 +597,10 @@ static bool radio_load_rsa_public_key(ftp_client_t *ftp,
 }
 
 
+/* Public helper: translate a global address into the radio address we must
+ * dial. Used by send_reply() in main and by the DH handlers here. It re-
+ *downloads the neighbour file each time, which is slow but keeps the file the
+ * single source of truth and avoids any stale in-memory copy. */
 bool radio_find_neighbor_local_address(ftp_client_t *ftp,
                                                uint32_t global_address,
                                                uint16_t *local_address)
@@ -469,6 +619,7 @@ bool radio_find_neighbor_local_address(ftp_client_t *ftp,
     if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
         return false;
 
+    /* Linear scan: at most 8 neighbours, so no index is worth the RAM. */
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
         if (neighbors[i].global_address == global_address)
@@ -481,7 +632,14 @@ bool radio_find_neighbor_local_address(ftp_client_t *ftp,
     return false;
 }
 
-
+/* -------------------------------------------------------------------------
+ * SENDING A SIGNED, FRAGMENTED DH MESSAGE
+ *
+ * The only place a large payload is split for the radio. It writes a 4-byte
+ * header (total length, offset) in front of each piece so the receiver can
+ * reassemble it, and keeps the SAME sequence number for every fragment - that
+ * is what the reassembly state machines key on.
+ * ------------------------------------------------------------------------- */
 static bool radio_send_dh_signed_message(e32_t *device,
                                          uint32_t source,
                                          uint32_t destination,
@@ -499,6 +657,9 @@ static bool radio_send_dh_signed_message(e32_t *device,
         message_length + RADIO_DH_SIGNATURE_SIZE > RADIO_DH_SIGNED_REQUEST_SIZE)
         return false;
 
+    /* Message and signature are laid end to end once, then cut into pieces.
+     * Keeping them in one buffer is what makes the offsets below simple and
+     * lets the receiver split them again at a fixed, known boundary. */
     uint8_t signed_request[RADIO_DH_SIGNED_REQUEST_SIZE];
     size_t signed_request_length = message_length + RADIO_DH_SIGNATURE_SIZE;
     memcpy(signed_request, message, message_length);
@@ -506,13 +667,19 @@ static bool radio_send_dh_signed_message(e32_t *device,
            signature,
            RADIO_DH_SIGNATURE_SIZE);
 
+    /* Cut the buffer into radio-sized chunks. Note the empty increment: the
+     * loop advances at the bottom, by exactly the bytes it just sent. */
     for (size_t offset = 0; offset < signed_request_length;)
     {
+        /* Clamp to one frame; the last iteration sends the remainder. */
         size_t remaining = signed_request_length - offset;
         uint16_t fragment_length = (uint16_t)(remaining >
                                                RADIO_DH_RSA_FRAGMENT_DATA_SIZE
                                                    ? RADIO_DH_RSA_FRAGMENT_DATA_SIZE
                                                    : remaining);
+        /* Every fragment carries the same total length and its own offset,
+         * plus the same sequence number, so an interleaved packet from a
+         * different exchange cannot be mixed into this one. */
         uint8_t fragment_data[RADIO_MAX_DATA];
         radio_write_u16_be(fragment_data,
                            (uint16_t)signed_request_length);
@@ -546,6 +713,20 @@ static bool radio_send_dh_signed_message(e32_t *device,
 }
 
 
+/* ==========================================================================
+ * THE GLOBAL CONNECTION GRAPH - in-place editing of global_connections.bin
+ *
+ * Layout: rows of 9 uint32. Column 0 is the row's owner, columns 1..8 are
+ * its neighbours, 0 means empty. Every handler that changes the mesh ends up
+ * here, then uploads the whole file back to FTP.
+ *
+ * The 'changed' out-parameter threaded through these functions exists so the
+ * caller can skip the FTP upload when a packet brought no new information -
+ * which is extremely common, because the same announcement reaches every node.
+ * ==========================================================================*/
+
+/* Read one address out of the buffer. memcpy rather than a cast: the buffer
+ * is a byte array whose alignment is not guaranteed to be 4. */
 static uint32_t radio_read_global_connection_word(size_t offset)
 {
     uint32_t value;
@@ -560,6 +741,9 @@ static void radio_write_global_connection_word(size_t offset, uint32_t value)
 }
 
 
+/* Pull the graph from FTP into the buffer. The modulo check is the format
+ * check: a file whose size is not a whole number of rows is corrupt and must
+ * not be used, because every later index computation assumes row alignment. */
 static bool radio_download_global_connections(ftp_client_t *ftp)
 {
     global_connections_file_length = 0;
@@ -575,6 +759,8 @@ static bool radio_download_global_connections(ftp_client_t *ftp)
 }
 
 
+/* Locate the row belonging to a node. Rows are unordered, so this is a scan;
+ * with a 4 KiB cap that is at most ~450 comparisons. */
 static bool radio_find_global_connection_row(uint32_t address,
                                              size_t *row_index)
 {
@@ -595,6 +781,9 @@ static bool radio_find_global_connection_row(uint32_t address,
 }
 
 
+/* Is this address anywhere in the graph? Scans every word, not just column
+ * 0, so it answers 'is this node known at all', which is what
+ * Respond_To_New_Node uses to decide whether to rebroadcast. */
 static bool radio_global_connection_saved(uint32_t global_address)
 {
     for (size_t offset = 0;
@@ -609,6 +798,9 @@ static bool radio_global_connection_saved(uint32_t global_address)
 }
 
 
+/* Get the row for a node, creating an empty one if it does not exist.
+ * Sets *changed only when a row really was added. This is the 'insert'
+ * half of every graph edit. */
 static bool radio_ensure_global_connection_row(uint32_t address,
                                                size_t *row_index,
                                                bool *changed)
@@ -633,6 +825,11 @@ static bool radio_ensure_global_connection_row(uint32_t address,
 }
 
 
+/* Add one edge to an existing row.
+ *
+ * The loop deliberately looks at all 8 neighbour columns before deciding,
+ * because it has to detect both 'already there' (no change, return true)
+ * and 'first free slot' (use it) in one pass. */
 static bool radio_add_connection_to_row(size_t row_index,
                                         uint32_t neighbor_address,
                                         bool *changed)
@@ -640,14 +837,15 @@ static bool radio_add_connection_to_row(size_t row_index,
     size_t row_offset = row_index * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
     size_t empty_offset = RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
 
+    /* Scan the 8 neighbour columns. */
     for (uint8_t column = 1; column < 9; ++column)
     {
         size_t offset = row_offset + column * sizeof(uint32_t);
         uint32_t existing = radio_read_global_connection_word(offset);
         if (existing == neighbor_address)
-            return true;
+            return true; /* edge already present: not a change */
         if (existing == 0 && empty_offset == RADIO_GLOBAL_CONNECTIONS_ROW_SIZE)
-            empty_offset = offset - row_offset;
+            empty_offset = offset - row_offset; /* remember the first hole */
     }
 
     if (empty_offset == RADIO_GLOBAL_CONNECTIONS_ROW_SIZE)
@@ -660,6 +858,9 @@ static bool radio_add_connection_to_row(size_t row_index,
 }
 
 
+/* The primitive every mesh edit is built from: record an edge in BOTH
+ * directions. Doing it symmetrically is what lets any node later run a
+ * search over the graph without knowing which node learned the edge first. */
 static bool radio_add_connection_edge(uint32_t first_address,
                                       uint32_t second_address,
                                       bool *changed)
@@ -684,6 +885,9 @@ static bool radio_add_connection_edge(uint32_t first_address,
 }
 
 
+/* --- the removal wave, part 1: 'have I already processed this?' ---------
+ * A plain ring buffer, not a set: we only need 'did I see this before', and
+ * a bounded history is enough because the wave is finite. */
 static bool radio_node_removal_seen(uint32_t global_address)
 {
     for (size_t i = 0; i < RADIO_NODE_REMOVAL_CACHE_SIZE; ++i)
@@ -696,6 +900,7 @@ static bool radio_node_removal_seen(uint32_t global_address)
 }
 
 
+/* Record that we processed this removal, overwriting the oldest entry. */
 static void radio_mark_node_removal_seen(uint32_t global_address)
 {
     radio_node_removal_cache[radio_node_removal_cache_next] = global_address;
@@ -704,6 +909,10 @@ static void radio_mark_node_removal_seen(uint32_t global_address)
 }
 
 
+/* Delete a node from the graph: drop its own row and blank every reference
+ * to it in other rows. The compaction (retained_rows) is what keeps the
+ * file a whole number of rows, so the format check on the next download
+ * still passes. */
 static bool radio_remove_global_connection_node(uint32_t global_address,
                                                 bool *changed)
 {
@@ -711,6 +920,8 @@ static bool radio_remove_global_connection_node(uint32_t global_address,
                        RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
     size_t retained_rows = 0;
 
+    /* Compact-in-place rewrite: rows we keep are slid down over the ones we
+     * drop, so no second buffer is needed. */
     for (size_t row = 0; row < row_count; ++row)
     {
         size_t row_offset = row * RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
@@ -718,9 +929,11 @@ static bool radio_remove_global_connection_node(uint32_t global_address,
         if (row_address == global_address)
         {
             *changed = true;
-            continue;
+            continue; /* this is the node itself: its row is deleted */
         }
 
+        /* Any other row that lists it as a neighbour keeps the row but
+         * blanks the slot, so the edge disappears from both sides. */
         for (uint8_t column = 1; column < 9; ++column)
         {
             size_t word_offset = row_offset + column * sizeof(uint32_t);
@@ -747,6 +960,13 @@ static bool radio_remove_global_connection_node(uint32_t global_address,
 }
 
 
+/* Decode local_neighbors.txt into a struct array.
+ *
+ * The file is text on purpose ("%08lX,%u\n" per line) so it can be inspected
+ * with a plain FTP client. The parser is deliberately strict: a line is only
+ * accepted if the hex part ends exactly at the comma and the decimal part
+ * ends exactly at the line end. Anything else is skipped, so a hand-edited
+ * or corrupted file degrades to 'fewer neighbours' rather than to garbage. */
 bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
                                uint8_t *neighbor_count)
 {
@@ -754,30 +974,36 @@ bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
     char *end = (char *)neighbor_file + neighbor_file_length;
     uint8_t count = 0;
 
+    /* One iteration per line, stopping at the buffer end or the cap. */
     while (line < end && count < RADIO_NEIGHBOR_COUNT_MAX)
     {
+        /* Find the end of this line; the last line may have no newline. */
         char *line_end = memchr(line, '\n', (size_t)(end - line));
         if (line_end == NULL)
             line_end = end;
 
-        *line_end = '\0';
+        *line_end = '\0'; /* temporarily terminate so strtoul can be used */
 
         char *separator = strchr(line, ',');
         if (separator != NULL)
         {
             char *global_end;
             char *local_end;
+            /* Global address is hex (it is a 32-bit counter), the local one
+             * is decimal (it is a 16-bit radio address). */
             unsigned long global_address = strtoul(line, &global_end, 16);
             unsigned long local_address = strtoul(separator + 1,
                                                   &local_end,
                                                   10);
 
+            /* Tolerate the whitespace a human might have typed. */
             while (*global_end == ' ' || *global_end == '\t')
                 ++global_end;
             while (*local_end == ' ' || *local_end == '\t' ||
                    *local_end == '\r')
                 ++local_end;
 
+            /* Strict acceptance test, including the range checks. */
             if (global_end == separator && *local_end == '\0' &&
                 global_address <= UINT32_MAX && local_address <= UINT16_MAX)
             {
@@ -795,6 +1021,15 @@ bool radio_parse_neighbor_file(radio_neighbor_t *neighbors,
 }
 
 
+/* ==========================================================================
+ * PUBLIC PROTOCOL FUNCTIONS
+ *
+ * From here on the functions correspond one-to-one to the commands listed in
+ * radio_packet_protocol.h. Read them in the order the boot sequence uses them:
+ * download/parse the neighbour file -> pick a local address -> announce
+ * ourselves -> pull the global graph and the key ledger -> optionally start a
+ * DH exchange.
+ * ==========================================================================*/
 bool radio_download_neighbor_file(ftp_client_t *ftp)
 {
     neighbor_file_length = 0;
@@ -828,6 +1063,10 @@ bool radio_is_new_node(ftp_client_t *ftp)
 }
 
 
+/* Pick the neighbour with the SMALLEST global address, i.e. the node that
+ * was created earliest. That node has had the longest time to learn about the
+ * mesh, so its copy of global_connections.bin is the most complete one
+ * available nearby - which is why the join sequence asks it and nobody else. */
 static bool radio_find_oldest_neighbor(uint32_t global_address,
                                        radio_neighbor_t *oldest,
                                        ftp_client_t *ftp)
@@ -852,6 +1091,7 @@ static bool radio_find_oldest_neighbor(uint32_t global_address,
         return false;
     }
 
+    /* Scan our neighbours, skipping ourselves, and keep the minimum. */
     bool found = false;
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
@@ -869,12 +1109,17 @@ static bool radio_find_oldest_neighbor(uint32_t global_address,
 }
 
 
-static uint16_t radio_read_u16_be(const uint8_t *data)
+/* Reads the local address out of a 6-byte neighbour record produced by
+ * Respond_To_Connections_Request: [global:4][local:2]. The offset is baked in
+ * on purpose, and the name now says so - it is NOT a generic big-endian reader
+ * (that one is radio_read_u16_be_value). */
+static uint16_t radio_read_local_address_in_record(const uint8_t *record)
 {
-    return (uint16_t)(((uint16_t)data[4] << 8) | data[5]);
+    return (uint16_t)(((uint16_t)record[4] << 8) | record[5]);
 }
 
 
+/* The generic writers, used by every handler that builds a payload. */
 static void radio_write_u16_be(uint8_t *data, uint16_t value)
 {
     data[0] = (uint8_t)(value >> 8);
@@ -891,6 +1136,9 @@ static void radio_write_u32_be(uint8_t *data, uint32_t value)
 }
 
 
+/* Is a candidate radio address already taken by someone we know?
+ * Linear scan over at most 64 entries - small enough that a set would cost
+ * more RAM than it saves. */
 static bool radio_local_address_used(const uint16_t *addresses,
                                      size_t address_count,
                                      uint16_t candidate)
@@ -905,6 +1153,16 @@ static bool radio_local_address_used(const uint16_t *addresses,
 }
 
 
+/* -------------------------------------------------------------------------
+ * LOCAL ADDRESS ALLOCATION - step 2 of the join sequence.
+ *
+ * The E32 radio addresses nodes with a bare 16-bit number, so two physically
+ * adjacent nodes that picked the same number would hear each other's packets
+ * mixed together. There is no coordinator, so the node asks every neighbour
+ * for ITS neighbour list, unions all the addresses in use, and takes a free
+ * one. A collision is only possible with a node that is not in either list,
+ * i.e. one that is out of range - where a clash does not matter.
+ * ------------------------------------------------------------------------- */
 uint16_t Generate_Local_Adress(uint32_t global_address,
                                e32_t *radio,
                                ftp_client_t *ftp)
@@ -929,6 +1187,9 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
         return 0;
     }
 
+    /* Phase 1 - ask every neighbour for its neighbour list.
+     * A different sequence number per neighbour, so the replies can be told
+     * apart even though they all carry the same command. */
     uint16_t sequence = 1;
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
@@ -949,11 +1210,18 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
                    (unsigned long)neighbors[i].global_address);
     }
 
+    /* Phase 2 - collect the answers. This is the only non-deterministic part
+     * of the protocol: packets arrive in any order and may interleave with
+     * unrelated traffic, so the filter below has to accept only our own
+     * requests' replies. The length checks re-derive the record structure
+     * from the wire, so a malformed packet is simply ignored. */
     uint16_t received_local_addresses[64];
     size_t received_count = 0;
     absolute_time_t timeout =
         make_timeout_time_ms(RADIO_CONNECTION_RESPONSE_TIMEOUT_MS);
 
+    /* Wait a fixed window rather than a fixed count: a neighbour that does
+     * not answer just contributes nothing. */
     while (!time_reached(timeout))
     {
         radio_packet_t response;
@@ -965,13 +1233,15 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
                                RADIO_CONNECTION_RECORD_SIZE &&
             response.length % RADIO_CONNECTION_RECORD_SIZE == 0)
         {
+            /* Walk the payload as 6-byte records: [global:4][local:2]. */
             for (uint16_t offset = 0;
                  offset < response.length && received_count < 64;
                  offset += RADIO_CONNECTION_RECORD_SIZE)
             {
                 uint16_t local_address =
-                    radio_read_u16_be(&response.data[offset]);
+                    radio_read_local_address_in_record(&response.data[offset]);
 
+                /* De-duplicate: the same neighbour appears in several lists. */
                 if (!radio_local_address_used(received_local_addresses,
                                                received_count,
                                                local_address))
@@ -985,6 +1255,9 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
         sleep_ms(1);
     }
 
+    /* Phase 3 - choose. Start from a random value so that two nodes joining
+     * at the same moment do not both pick 1, then walk forward deterministically
+     * so the search always terminates. 0 is never used: it means 'unused'. */
     uint16_t candidate = (uint16_t)(get_rand_32() % UINT16_MAX) + 1u;
     for (uint32_t attempts = 0; attempts < UINT16_MAX; ++attempts)
     {
@@ -1000,6 +1273,12 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
 }
 
 
+/* -------------------------------------------------------------------------
+ * Serving side of the neighbour-list exchange (RADIO_CMD_SEND_CONNECTIONS).
+ * Paired with the collection loop in Generate_Local_Adress: this is what
+ * answers that request. It is also the reason every node's view of its
+ * physical neighbourhood is symmetric.
+ * ------------------------------------------------------------------------- */
 bool Respond_To_Connections_Request(uint32_t global_address,
                                      e32_t *radio,
                                      ftp_client_t *ftp,
@@ -1026,6 +1305,7 @@ bool Respond_To_Connections_Request(uint32_t global_address,
         return false;
     }
 
+    /* Serialize our neighbour list into the 6-byte record format. */
     uint8_t response_data[RADIO_CONNECTIONS_PER_PACKET *
                           RADIO_CONNECTION_RECORD_SIZE];
     for (uint8_t i = 0; i < neighbor_count; ++i)
@@ -1048,6 +1328,9 @@ bool Respond_To_Connections_Request(uint32_t global_address,
                                           RADIO_CONNECTION_RECORD_SIZE)))
         return false;
 
+    /* Choose the radio to answer through. We must NOT broadcast: only the
+     * requester can be the one waiting for this reply, and broadcasting would
+     * also reach every other neighbour, wasting radio traffic. */
     uint16_t e32_destination = 0xFFFF;
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
@@ -1062,6 +1345,13 @@ bool Respond_To_Connections_Request(uint32_t global_address,
 }
 
 
+/* -------------------------------------------------------------------------
+ * PULL THE GLOBAL GRAPH (join-sequence step 4a).
+ *
+ * Only the oldest neighbour is asked, and only once: its copy of the graph is
+ * the most complete one around. The result is uploaded to OUR OWN FTP server,
+ * which is where this node's permanent copy of the mesh lives.
+ * ------------------------------------------------------------------------- */
 bool Request_Global_Connections(uint32_t global_address,
                                 e32_t *radio,
                                 ftp_client_t *ftp)
@@ -1093,6 +1383,10 @@ bool Request_Global_Connections(uint32_t global_address,
         return false;
     }
 
+    /* Reassembly of a chunked file. Each chunk says 'the file is N bytes
+     * long, this piece starts at offset M'. Accepting a chunk only when
+     * M equals what we have so far is what makes out-of-order or duplicated
+     * chunks harmless, and lets us stop as soon as the file is complete. */
     global_connections_file_length = 0;
     absolute_time_t timeout = make_timeout_time_ms(
         RADIO_GLOBAL_CONNECTIONS_RESPONSE_TIMEOUT_MS);
@@ -1113,12 +1407,17 @@ bool Request_Global_Connections(uint32_t global_address,
             uint16_t chunk_length = (uint16_t)(response.length -
                                                RADIO_GLOBAL_CONNECTIONS_CHUNK_HEADER_SIZE);
 
+            /* Every condition here is a rejection of a possible corruption:
+             * too big for RAM, not a whole number of rows, not the piece we
+             * expect next, bigger than one frame, or past the declared end. */
             if (total_length <= sizeof(global_connections_file) &&
                 total_length % RADIO_GLOBAL_CONNECTIONS_ROW_SIZE == 0 &&
                 offset == global_connections_file_length &&
                 chunk_length <= RADIO_GLOBAL_CONNECTIONS_CHUNK_SIZE &&
                 offset + chunk_length <= total_length)
             {
+                /* The first accepted chunk fixes the target size; every later
+                 * chunk must agree with it or it is discarded. */
                 if (expected_length == 0)
                     expected_length = total_length;
 
@@ -1159,6 +1458,10 @@ bool Request_Global_Connections(uint32_t global_address,
 }
 
 
+/* -------------------------------------------------------------------------
+ * Serving side of the graph transfer. Paired with the reassembly loop above:
+ * same chunk header, same sizes, opposite direction.
+ * ------------------------------------------------------------------------- */
 bool Respond_To_Global_Connections_Request(uint32_t global_address,
                                            e32_t *radio,
                                            ftp_client_t *ftp,
@@ -1216,6 +1519,9 @@ bool Respond_To_Global_Connections_Request(uint32_t global_address,
         return false;
     }
 
+    /* Stream the file out in RADIO_MAX_DATA-sized pieces. The sequence number
+     * is incremented per chunk so the receiver can see progress and reject a
+     * chunk that belongs to a different request. */
     uint16_t chunk_sequence = request->sequence;
     for (uint32_t offset = 0;
          offset < global_connections_file_length;
@@ -1255,6 +1561,13 @@ bool Respond_To_Global_Connections_Request(uint32_t global_address,
 }
 
 
+/* -------------------------------------------------------------------------
+ * PULL THE RSA KEY LEDGER (join-sequence step 4b).
+ *
+ * Unlike the graph, this file is verified with a CRC-32 and retried, because
+ * a wrong key does not crash anything - it silently makes every later
+ * signature check fail, which is much harder to notice.
+ * ------------------------------------------------------------------------- */
 bool Request_Global_RSA_Keys(uint32_t global_address,
                              e32_t *radio,
                              ftp_client_t *ftp)
@@ -1279,6 +1592,9 @@ bool Request_Global_RSA_Keys(uint32_t global_address,
         return false;
     }
 
+    /* Sort neighbours oldest-first (selection sort, at most 8 items).
+     * Try the most-informed neighbour first so the first attempt usually
+     * succeeds and no retry traffic is generated. */
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
         for (uint8_t j = (uint8_t)(i + 1); j < neighbor_count; ++j)
@@ -1292,6 +1608,8 @@ bool Request_Global_RSA_Keys(uint32_t global_address,
         }
     }
 
+    /* Try each neighbour in turn; the inner loop retries the same neighbour,
+     * which covers a lost or corrupted transmission. */
     static uint16_t sequence;
     for (uint8_t neighbor_index = 0;
          neighbor_index < neighbor_count;
@@ -1299,7 +1617,7 @@ bool Request_Global_RSA_Keys(uint32_t global_address,
     {
         radio_neighbor_t *provider = &neighbors[neighbor_index];
         if (provider->global_address == global_address)
-            continue;
+            continue; /* that is us: our own copy is already correct */
 
         for (uint8_t attempt = 0;
              attempt < RADIO_GLOBAL_RSA_KEYS_ATTEMPTS_PER_NEIGHBOR;
@@ -1370,6 +1688,9 @@ bool Request_Global_RSA_Keys(uint32_t global_address,
                 sleep_ms(1);
             }
 
+            /* Three independent checks: the declared size was reached, nothing
+             * was dropped, and the CRC the sender advertised matches. Only
+             * then is the ledger safe to store. */
             bool complete = expected_length > 0 &&
                             global_rsa_keys_file_length == expected_length &&
                             radio_crc32(global_rsa_keys_file,
@@ -1391,6 +1712,8 @@ bool Request_Global_RSA_Keys(uint32_t global_address,
                 return false;
             }
 
+            /* Tell the provider we stored it. Without this the provider would
+             * keep re-sending the whole file every time it sees our request. */
             radio_packet_t acknowledgement;
             if (!radio_packet_create(&acknowledgement,
                                      global_address,
@@ -1416,6 +1739,9 @@ bool Request_Global_RSA_Keys(uint32_t global_address,
 }
 
 
+/* Serving side of the key-ledger transfer. Note the CRC is computed once over
+ * the whole file and repeated in every chunk header - the receiver only needs
+ * it once, but repeating it makes a truncated stream detectable. */
 bool Respond_To_Global_RSA_Keys_Request(uint32_t global_address,
                                         e32_t *radio,
                                         ftp_client_t *ftp,
@@ -1473,6 +1799,7 @@ bool Respond_To_Global_RSA_Keys_Request(uint32_t global_address,
         return false;
     }
 
+    /* Chunked send, same geometry as the graph transfer above. */
     uint32_t file_crc = radio_crc32(global_rsa_keys_file,
                                     global_rsa_keys_file_length);
     uint32_t offset = 0;
@@ -1516,6 +1843,17 @@ bool Respond_To_Global_RSA_Keys_Request(uint32_t global_address,
 }
 
 
+/* -------------------------------------------------------------------------
+ * SHORTEST ROUTE THROUGH THE MESH (breadth-first search)
+ *
+ * This is what makes the Diffie-Hellman exchange possible between nodes that
+ * are not physically adjacent: it turns the adjacency list into an ordered
+ * list of global addresses, which the DH senders then convert hop by hop into
+ * 16-bit radio addresses with radio_find_neighbor_local_address.
+ *
+ * Everything is done on indices into nodes[] rather than on addresses, so the
+ * 'is this node already visited' test is an array lookup instead of a scan.
+ * ------------------------------------------------------------------------- */
 bool Find_Shortest_Global_Route(uint32_t source,
                                 uint32_t destination,
                                 ftp_client_t *ftp,
@@ -1548,6 +1886,9 @@ bool Find_Shortest_Global_Route(uint32_t source,
         return true;
     }
 
+    /* Parallel arrays = a tiny struct-of-arrays graph node record.
+     * parent is -1 for 'unvisited', -2 for 'this is the start' (so the
+     * reconstruction loop below has a sentinel to stop at). */
     uint32_t nodes[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
     int16_t parent[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
     uint8_t depth[RADIO_GLOBAL_CONNECTIONS_MAX_NODES];
@@ -1556,8 +1897,12 @@ bool Find_Shortest_Global_Route(uint32_t source,
     size_t row_count = global_connections_file_length /
                        RADIO_GLOBAL_CONNECTIONS_ROW_SIZE;
 
+    /* Phase 1 - build the vertex set. Every address mentioned anywhere in the
+     * file becomes a node, whether or not it owns a row (a node can appear
+     * only as someone else's neighbour). */
     for (size_t row = 0; row < row_count; ++row)
     {
+        /* Column 0 is the row owner, 1..8 are its neighbours. */
         for (uint8_t column = 0; column < 9; ++column)
         {
             uint32_t address;
@@ -1569,6 +1914,9 @@ bool Find_Shortest_Global_Route(uint32_t source,
             if (address == 0)
                 continue;
 
+            /* De-duplicate: the same address appears in its own row and in
+             * every row that lists it as a neighbour. Linear because the
+             * vertex count is bounded by the 4 KiB file cap. */
             bool already_present = false;
             for (size_t i = 0; i < node_count; ++i)
             {
@@ -1589,6 +1937,8 @@ bool Find_Shortest_Global_Route(uint32_t source,
         }
     }
 
+    /* Phase 2 - map the two endpoints to indices. node_count is used as the
+     * 'not found' sentinel, which is safe because it is one past the end. */
     size_t source_index = node_count;
     size_t destination_index = node_count;
     for (size_t i = 0; i < node_count; ++i)
@@ -1606,17 +1956,27 @@ bool Find_Shortest_Global_Route(uint32_t source,
         return false;
     }
 
+    /* Phase 3 - the breadth-first search. FIFO order is what guarantees the
+     * first time we reach the destination it is by a shortest route, which
+     * is what keeps radio traffic minimal. */
     size_t queue_head = 0;
     size_t queue_tail = 0;
     queue[queue_tail++] = (uint16_t)source_index;
     parent[source_index] = -2;
 
+    /* Stop as soon as the destination has a parent: no need to explore the
+     * rest of the mesh. */
     while (queue_head < queue_tail && parent[destination_index] == -1)
     {
         size_t current_index = queue[queue_head++];
+        /* Depth cap: a route longer than the packet's path[] could not be
+         * transmitted anyway, so we refuse it instead of truncating it. */
         if (depth[current_index] >= RADIO_GLOBAL_ROUTE_MAX_JUMPS)
             continue;
 
+        /* Find the row for the current node. The file is unsorted, so this
+         * is a scan - acceptable at a few hundred rows, and it is the reason
+         * the search is O(V^2) rather than O(V+E). */
         size_t row = row_count;
         for (size_t candidate_row = 0; candidate_row < row_count; ++candidate_row)
         {
@@ -1634,6 +1994,7 @@ bool Find_Shortest_Global_Route(uint32_t source,
         if (row == row_count)
             continue;
 
+        /* Expand: push every neighbour we have not visited yet. */
         for (uint8_t column = 1; column < 9; ++column)
         {
             uint32_t neighbor;
@@ -1644,6 +2005,8 @@ bool Find_Shortest_Global_Route(uint32_t source,
             if (neighbor == 0)
                 continue;
 
+            /* Translate the address back to an index, and skip it if it is
+             * unknown or already reached (parent != -1 means visited). */
             size_t neighbor_index = node_count;
             for (size_t i = 0; i < node_count; ++i)
             {
@@ -1657,6 +2020,8 @@ bool Find_Shortest_Global_Route(uint32_t source,
             if (neighbor_index == node_count || parent[neighbor_index] != -1)
                 continue;
 
+            /* Recording the parent is both the visited mark and the
+             * breadcrumb trail used by the reconstruction below. */
             parent[neighbor_index] = (int16_t)current_index;
             depth[neighbor_index] = (uint8_t)(depth[current_index] + 1);
             queue[queue_tail++] = (uint16_t)neighbor_index;
@@ -1671,6 +2036,8 @@ bool Find_Shortest_Global_Route(uint32_t source,
         return false;
     }
 
+    /* Phase 4 - walk the breadcrumbs backwards from the destination until the
+     * start's sentinel (-2) is reached. This yields the route in reverse. */
     uint16_t reverse_path[RADIO_GLOBAL_ROUTE_MAX_ADDRESSES];
     uint8_t reverse_length = 0;
     for (int16_t current = (int16_t)destination_index;
@@ -1683,6 +2050,8 @@ bool Find_Shortest_Global_Route(uint32_t source,
     if (reverse_length == 0 || reverse_length > RADIO_GLOBAL_ROUTE_MAX_ADDRESSES)
         return false;
 
+    /* Flip it, so path[0] is the requester and path[n-1] the target - the
+     * order radio_packet_set_path and the senders expect. */
     for (uint8_t i = 0; i < reverse_length; ++i)
         path[i] = nodes[reverse_path[reverse_length - i - 1]];
 
@@ -1691,6 +2060,16 @@ bool Find_Shortest_Global_Route(uint32_t source,
 }
 
 
+/* -------------------------------------------------------------------------
+ * MESH CHANGE PROPAGATION
+ *
+ * None of these functions has a global view. Each one tells its neighbours
+ * and each neighbour relays further, so a change spreads as a wave through
+ * the graph. The removal cache and the 'already known' tests are what stop
+ * that wave from bouncing back along the edge it came from.
+ * ------------------------------------------------------------------------- */
+
+/* Tell everyone we know that a node has left the mesh. */
 bool Relay_Node_Removal(uint32_t global_address,
                         e32_t *radio,
                         ftp_client_t *ftp)
@@ -1698,6 +2077,8 @@ bool Relay_Node_Removal(uint32_t global_address,
     if (radio == NULL || ftp == NULL || global_address == 0)
         return false;
 
+    /* Already processed this removal? Return success without re-sending,
+     * which is the termination condition of the wave. */
     if (radio_node_removal_seen(global_address))
         return true;
 
@@ -1721,6 +2102,9 @@ bool Relay_Node_Removal(uint32_t global_address,
         return false;
     }
 
+    /* Send to every neighbour except the node that is being removed (it is
+     * gone, so nobody there needs the news) and count failures rather than
+     * aborting: a partial wave is still useful to the rest of the mesh. */
     static uint16_t sequence;
     ++sequence;
     radio_mark_node_removal_seen(global_address);
@@ -1752,6 +2136,10 @@ bool Relay_Node_Removal(uint32_t global_address,
 }
 
 
+/* Announce a node that has just joined. The payload is the same 9-word
+ * record used everywhere: [new node, its neighbours..., 0 padding]. Sending
+ * the neighbour list with the announcement is what lets a distant node insert
+ * the correct edges without ever talking to the new node directly. */
 bool Relay_New_Node(uint32_t global_address,
                     e32_t *radio,
                     ftp_client_t *ftp)
@@ -1776,6 +2164,9 @@ bool Relay_New_Node(uint32_t global_address,
         return false;
     }
 
+    /* Build the record: our own address first, then every neighbour we have,
+     * skipping ourselves. Zero-initialised, so unused slots are the 'empty'
+     * marker the receiving side expects. */
     uint8_t node_record[RADIO_NEW_NODE_RECORD_SIZE] = {0};
     radio_write_u32_be(node_record, global_address);
     for (uint8_t i = 0; i < neighbor_count; ++i)
@@ -1813,6 +2204,9 @@ bool Relay_New_Node(uint32_t global_address,
 }
 
 
+/* Receiving side of the join announcement. This is where a node that is far
+ * from the newcomer still learns about it: the record carries the newcomer's
+ * own neighbour list, so the edges can be added locally. */
 bool Respond_To_New_Node(uint32_t global_address,
                          e32_t *radio,
                          ftp_client_t *ftp,
@@ -1832,6 +2226,7 @@ bool Respond_To_New_Node(uint32_t global_address,
     if (new_global_address == global_address)
         return true;
 
+    /* Read the announced neighbour list out of the payload. */
     uint32_t announced_neighbors[RADIO_NEIGHBOR_COUNT_MAX];
     uint8_t announced_count = 0;
     for (uint8_t i = 0; i < RADIO_NEIGHBOR_COUNT_MAX; ++i)
@@ -1870,6 +2265,7 @@ bool Respond_To_New_Node(uint32_t global_address,
         return false;
     }
 
+    /* Merge every announced edge into our copy of the graph. */
     for (uint8_t i = 0; i < announced_count; ++i)
     {
         if (!radio_add_connection_edge(new_global_address,
@@ -1894,7 +2290,9 @@ bool Respond_To_New_Node(uint32_t global_address,
         return false;
     }
 
-    /* Known nodes may need missing graph edges repaired, but not rebroadcast. */
+    /* Only a node we had never heard of is worth relaying. A known node may
+     * have needed edge repair (done above) but re-broadcasting it would make
+     * the wave infinite. */
     if (already_known)
         return true;
 
@@ -1915,6 +2313,8 @@ bool Respond_To_New_Node(uint32_t global_address,
         return false;
     }
 
+    /* Forward the announcement unchanged, but re-addressed as coming from the
+     * new node (not from us) and sent to every neighbour we have. */
     static uint16_t sequence;
     bool sent = true;
     for (uint8_t i = 0; i < neighbor_count; ++i)
@@ -1941,6 +2341,8 @@ bool Respond_To_New_Node(uint32_t global_address,
 }
 
 
+/* Publish our own public key. Called once per node; the relay form (below)
+ * is what carries other nodes' keys across the mesh. */
 bool Relay_RSA_Public_Key(uint32_t global_address,
                           mpz_t public_modulo,
                           e32_t *radio,
@@ -1973,6 +2375,7 @@ bool Relay_RSA_Public_Key(uint32_t global_address,
         return false;
     }
 
+    /* Skip ourselves: our own copy of the ledger already has our key. */
     static uint16_t sequence;
     bool sent = true;
     for (uint8_t i = 0; i < neighbor_count; ++i)
@@ -2000,6 +2403,9 @@ bool Relay_RSA_Public_Key(uint32_t global_address,
 }
 
 
+/* Receiving side of the key relay: store it if new, then pass it on.
+ * The 'already have it' test is the termination condition, exactly like the
+ * one in Respond_To_New_Node. */
 bool Respond_To_RSA_Key_Relay(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -2041,6 +2447,7 @@ bool Respond_To_RSA_Key_Relay(uint32_t global_address,
         return false;
     }
 
+    /* Append the row: 4-byte owner address, then the 256-byte modulus. */
     size_t row_offset = global_rsa_keys_file_length;
     radio_write_u32_be(&global_rsa_keys_file[row_offset], owner_address);
     memcpy(&global_rsa_keys_file[row_offset + sizeof(uint32_t)],
@@ -2077,9 +2484,15 @@ bool Respond_To_RSA_Key_Relay(uint32_t global_address,
 
     static uint16_t sequence;
     bool sent = true;
+    /* Relay to every neighbour except ourselves and except the key's owner:
+     * the owner already holds its own key, so sending it back is pure waste.
+     * (The packet does not record which hop it arrived from, so the owner is
+     * the only hop we can prove does not need it - that is why the previous
+     * code terminated only via radio_rsa_key_address_saved.) */
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
-        if (neighbors[i].global_address == global_address)
+        if (neighbors[i].global_address == global_address ||
+            neighbors[i].global_address == owner_address)
             continue;
 
         radio_packet_t relay;
@@ -2103,6 +2516,27 @@ bool Respond_To_RSA_Key_Relay(uint32_t global_address,
     return sent;
 }
 
+/* ==========================================================================
+ * THE DIFFIE-HELLMAN EXCHANGE
+ *
+ * Why it exists: two nodes that want to exchange encrypted DATA packets must
+ * agree on a key, and the only channel they have is the mesh itself. Classic
+ * DH needs two rounds of communication, which the route in
+ * Find_Shortest_Global_Route provides. The agreed value is then truncated to
+ * the ChaCha20-Poly1305 key used by handle_data_packet() in main.
+ *
+ * The three handlers below are the three legs of that conversation:
+ *   Create_DH_Exchange_Packet      -> we send g^a mod p
+ *   Respond_To_DH_Exchange_Request -> they answer with g^b mod p, we compute
+ *   Respond_To_DH_Exchange_Response-> we answer, they confirm
+ *   Respond_To_DH_Exchange_Result  -> the outcome is reported back
+ *
+ * Every leg is RSA-signed by its sender and verified against the key ledger,
+ * so a leg that cannot be attributed is dropped rather than acted on.
+ * ==========================================================================*/
+
+/* Leg 2, our side: we were asked. Reassemble the fragments, verify the
+ * signature, then generate our own exponent b and reply. */
 bool Respond_To_DH_Exchange_Request(uint32_t global_address,
                                     e32_t *radio_device,
                                     ftp_client_t *ftp,
@@ -2131,11 +2565,14 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
         fragment_length > total_length - offset)
         return false;
 
+    /* Already finished this exchange? Answer once, not once per fragment. */
     if (dh_request_completed_valid &&
         dh_request_completed_source == request->source &&
         dh_request_completed_sequence == request->sequence)
         return true;
 
+    /* Start a new reassembly only at a fragment with offset 0; anything else
+     * means we lost the beginning of the message and must drop the rest. */
     if (!dh_request_reassembly_active ||
         dh_request_reassembly_source != request->source ||
         dh_request_reassembly_sequence != request->sequence)
@@ -2154,6 +2591,8 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
     memcpy(&dh_request_reassembly[offset],
            &request->data[RADIO_DH_RSA_FRAGMENT_HEADER_SIZE],
            fragment_length);
+    /* Return early while the message is still incomplete: 'true' here means
+     * 'accepted, nothing to do yet'. Only a full reassembly continues down. */
     dh_request_reassembly_length += fragment_length;
     if (dh_request_reassembly_length < total_length)
         return true;
@@ -2220,6 +2659,9 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
         goto cleanup_dh_request;
     }
 
+    /* THE ACTUAL EXCHANGE. Generator 2 is a convention shared by all nodes,
+     * so it never has to be transmitted. We invent our own secret b, publish
+     * g^b mod p, and derive the secret as (g^a)^b mod p. */
     mpz_set_ui(generator, 2);
     DH_Generate_Private_Number(receiver_private_number);
     DH_Generate_Sending_Number(receiver_dh_number,
@@ -2231,6 +2673,10 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
                      dh_modulus,
                      receiver_private_number);
 
+        /* The reply carries g^b mod p AND a SHA-256 of the shared secret.
+         * That hash is the proof: the other end can recompute the secret from
+         * its own private number and compare, without ever transmitting the
+         * secret itself. */
         uint8_t response_message[RADIO_DH_RESPONSE_MESSAGE_SIZE];
         uint8_t shared_secret_bytes[RADIO_DH_FIELD_SIZE];
         uint8_t response_hash[RADIO_DH_HASH_SIZE];
@@ -2248,10 +2694,15 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
             response_hash,
             sizeof(response_hash));
 
+    /* The reply must go back along the exact route the request came by,
+     * reversed. Reversing rather than recomputing avoids two nodes disagreeing
+     * about which route connects them. */
     uint32_t response_route[RADIO_MAX_ROUTE_ADDRESSES];
     for (uint8_t i = 0; i < request->path_length; ++i)
         response_route[i] = request->path[request->path_length - i - 1u];
 
+    /* Convert the first hop of the reversed route into a radio address. If
+     * we cannot address that node, the reply cannot be sent at all. */
     uint16_t first_hop_local_address;
     if (!radio_find_neighbor_local_address(ftp,
                                            response_route[1],
@@ -2262,6 +2713,8 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
         goto cleanup_dh_request;
     }
 
+    /* Sign with OUR private key, then fragment the (message||signature)
+     * buffer onto the reversed route. */
     uint8_t response_signature[RADIO_DH_SIGNATURE_SIZE];
     radio_build_dh_signature_input(RADIO_CMD_SEND_ENCRYPTION_RESPONSE,
                                    global_address,
@@ -2292,6 +2745,9 @@ bool Respond_To_DH_Exchange_Request(uint32_t global_address,
         goto cleanup_dh_request;
     }
 
+    /* Remember that this exchange is done, so the other fragments of the same
+     * request are ignored, and remember that we now expect a result packet
+     * back from the origin. */
     dh_request_completed_source = request->source;
     dh_request_completed_sequence = request->sequence;
     dh_request_completed_valid = true;
@@ -2314,6 +2770,9 @@ cleanup_dh_request:
 }
 
 
+/* The tiny 'outcome' packet: no payload, just a signature over
+ * command+source+destination+sequence. The command itself (CONFIRMED/FAILED)
+ * is inside the signed bytes, so the outcome cannot be flipped in flight. */
 static bool radio_send_dh_exchange_result(e32_t *radio_device,
                                           uint32_t source,
                                           uint32_t destination,
@@ -2357,6 +2816,9 @@ static bool radio_send_dh_exchange_result(e32_t *radio_device,
 }
 
 
+/* Leg 3, our side: WE started the exchange and the other node has answered.
+ * Recompute the shared secret with the b we parked in dh_pending_* and check
+ * its hash against the one they sent. */
 bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                                      e32_t *radio_device,
                                      ftp_client_t *ftp,
@@ -2365,6 +2827,9 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                                      mpz_t rsa_modulus,
                                      mpz_t shared_secret)
 {
+    /* The pending state is the whole state machine here: a response is only
+     * meaningful if we actually sent a request, and it must match it exactly
+     * (source, destination and sequence). */
     if (radio_device == NULL || ftp == NULL || response == NULL ||
         !dh_pending_active ||
         response->command != RADIO_CMD_SEND_ENCRYPTION_RESPONSE ||
@@ -2389,6 +2854,8 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
         fragment_length > total_length - offset)
         return false;
 
+    /* Same fragment reassembly as the request side, but keyed by the
+     * response's own source/sequence. */
     if (!dh_response_reassembly_active ||
         dh_response_reassembly_source != response->source ||
         dh_response_reassembly_sequence != response->sequence)
@@ -2425,6 +2892,7 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                                    RADIO_DH_RESPONSE_MESSAGE_SIZE,
                                    signature_input);
 
+    /* The result packet goes back the way the response came, i.e. to us. */
     uint32_t result_route[RADIO_MAX_ROUTE_ADDRESSES];
     for (uint8_t i = 0; i < response->path_length; ++i)
         result_route[i] = response->path[response->path_length - i - 1u];
@@ -2448,6 +2916,7 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
     mpz_init(peer_dh_number);
     mpz_init(derived_secret);
 
+    /* Verify their signature with THEIR public key from the ledger. */
     bool matched = false;
     if (route_available &&
         radio_load_rsa_public_key(ftp,
@@ -2471,6 +2940,9 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                                message,
                                RADIO_DH_FIELD_SIZE);
 
+        /* Recompute the secret as (their g^b)^our a, then hash it and compare
+         * with the hash they sent. Equality proves both sides used the same
+         * p and the same a - it is the handshake's confirmation. */
         if (mpz_cmp_ui(peer_dh_number, 1) > 0 &&
             mpz_cmp(peer_dh_number, dh_modulus) < 0)
         {
@@ -2495,6 +2967,8 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
         }
     }
 
+    /* Always send a verdict, even a negative one: the other node needs to know
+     * the exchange is over so it can stop expecting our result packet. */
     uint16_t result_command = matched
                                   ? RADIO_CMD_DH_EXCHANGE_CONFIRMED
                                   : RADIO_CMD_DH_EXCHANGE_FAILED;
@@ -2510,6 +2984,8 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                                       private_rsa_exponent,
                                       rsa_modulus);
 
+    /* Only a confirmed AND delivered result makes the shared secret usable;
+     * main() sets shared_secret_valid only when these handlers return true. */
     bool success = matched && result_sent;
     if (success)
     {
@@ -2521,6 +2997,8 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
                (unsigned long)response->source);
     }
 
+    /* Retire the pending exchange so a new one with the same peer may start.
+     * The secrets are zeroed, never left in RAM. */
     if (result_sent)
     {
         dh_pending_active = false;
@@ -2538,6 +3016,9 @@ bool Respond_To_DH_Exchange_Response(uint32_t global_address,
 }
 
 
+/* Final leg: the origin receives the verdict. It is verified like everything
+ * else, then reported. Nothing is stored - the shared secret already lives in
+ * main()'s shared_secret, and this only closes the conversation. */
 bool Respond_To_DH_Exchange_Result(uint32_t global_address,
                                    ftp_client_t *ftp,
                                    const radio_packet_t *result)
@@ -2595,6 +3076,8 @@ bool Respond_To_DH_Exchange_Result(uint32_t global_address,
 }
 
 
+    /* These three are used by Handle_Radio_Packet below, which is defined
+     * before them in this file. */
 bool Respond_To_Local_Address(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -2611,6 +3094,9 @@ bool Respond_To_Node_Removal(uint32_t global_address,
                              const radio_packet_t *request);
 
                               
+/* A second dispatcher, kept inside radio.c. mesh_network_v1.c has its own
+ * switch and does not call this one, so it currently serves as documentation
+ * of the command-to-handler mapping. */
 bool Handle_Radio_Packet(uint32_t global_address,
                          e32_t *radio,
                          ftp_client_t *ftp,
@@ -2717,10 +3203,26 @@ bool Handle_Radio_Packet(uint32_t global_address,
 }
 
 
+/* ==========================================================================
+ * BOOT-TIME JOIN SEQUENCE
+ *
+ * join_mesh_as_new_node() in main() calls these in order:
+ *   Find_Neighbors -> Generate_Local_Adress -> Send_Local_Adress_To_Neighbors
+ *   -> Relay_New_Node -> Request_Global_RSA_Keys -> Request_Global_Connections
+ * Each step depends on the file written by the previous one, which is why the
+ * order below is fixed.
+ * ==========================================================================*/
+
+/* Step 1: broadcast a PING to every radio in range and collect the PONGs.
+ * A PONG carries the responder's 16-bit address, which is the only way a
+ * node can ever learn how to address a neighbour it has never met. */
 void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
 
     radio_packet_t ping_packet;
 
+    /* The PING is a broadcast on both layers: 0xFFFFFFFF globally (any node)
+     * and 0xFFFF on the radio (every device in range). Sequence 1 is fixed so
+     * the replies can be recognised below. */
     radio_packet_create(
         &ping_packet,
         Global_Adress,        // Global source
@@ -2757,6 +3259,8 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
 
 
     /* Listen for PONG responses */
+    /* Fixed listening window rather than a fixed count: we cannot know how
+     * many nodes are in range, so we simply collect whatever answers. */
     while (!time_reached(timeout))
     {
         radio_packet_t response;
@@ -2765,6 +3269,9 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
         {
             if (response.command == RADIO_CMD_PONG)
             {
+                /* Only accept our own PING's replies: the destination must be
+                 * us and the sequence must be the one we sent. Anything else
+                 * belongs to another node's conversation. */
                 if (response.destination == Global_Adress &&
                     response.sequence == 1)
                 {
@@ -2773,8 +3280,10 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
                         (unsigned long)response.source
                     );
 
-                    /* Add neighbor if there is room */
-                    if (neighbor_count < 8)
+                    /* A PONG with a short payload carries no local address:
+                     * reading data[0]/data[1] would be out of range, so such
+                     * a reply is ignored rather than recorded as garbage. */
+                    if (response.length >= 2 && neighbor_count < 8)
                     {
                         neighbors[neighbor_count].global_address =
                             response.source;
@@ -2816,7 +3325,11 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     * ...
     */
     
-    char neighbor_file[256];
+    /* Build the text file in memory. Renamed from the original local
+     * 'neighbor_file' so it no longer shadows the file-scope buffer of the
+     * same name; the two are unrelated. The format here must match exactly
+     * the one radio_parse_neighbor_file() accepts. */
+    char neighbor_text[256];
     size_t offset = 0;
 
 
@@ -2824,9 +3337,11 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     /* Write each neighbor */
     for (uint8_t i = 0; i < neighbor_count; i++)
     {
+        /* snprintf returns the length it WOULD have written, so the >= check
+         * is the buffer-full test and offset is advanced by the real length. */
         int len = snprintf(
-            neighbor_file + offset,
-            sizeof(neighbor_file) - offset,
+            neighbor_text + offset,
+            sizeof(neighbor_text) - offset,
             "%08lX,%u\n",
             (unsigned long)neighbors[i].global_address,
             (unsigned int)neighbors[i].local_address
@@ -2840,7 +3355,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
 
         offset += len;
 
-        if (offset >= sizeof(neighbor_file))
+        if (offset >= sizeof(neighbor_text))
         {
             printf("Neighbor file buffer full\n");
             return;
@@ -2852,7 +3367,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     if (!ftp_upload(
             ftp,
             "local_neighbors.txt",
-            (uint8_t *)neighbor_file,
+            (uint8_t *)neighbor_text,
             offset))
     {
         printf("FTP upload failed\n");
@@ -2864,6 +3379,9 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
 };
 
 
+/* Receiving side of the PING, called from main()'s dispatcher. Answering is
+ * the only way a node that has already joined can be discovered by a newcomer,
+ * so this keeps the physical graph symmetric over time. */
 void Ping_Response(uint32_t Global_Adress,
                    uint16_t Local_Adress,
                    e32_t *radio,
@@ -2890,6 +3408,9 @@ void Ping_Response(uint32_t Global_Adress,
         return;
     }
 
+    /* Refuse to answer when our own list is already full: adding this node
+     * would be impossible to record, so a half-tracked neighbour is worse
+     * than an undiscovered one. */
     if (neighbor_count >= RADIO_NEIGHBOR_COUNT_MAX)
     {
         printf("Neighbor limit reached; PONG not sent\n");
@@ -2907,6 +3428,7 @@ void Ping_Response(uint32_t Global_Adress,
         sender_packet.sequence      // Match the ping sequence
     );
 
+    /* The payload is our 16-bit radio address, big-endian, 2 bytes. */
     uint8_t pong_data[2];
 
     pong_data[0] = (Local_Adress >> 8) & 0xFF;
@@ -2928,6 +3450,8 @@ void Ping_Response(uint32_t Global_Adress,
 };
 
 
+/* Step 3 of the join sequence: publish the local address we chose. Without
+ * this the neighbours could not address us with their E32 radios. */
 bool Send_Local_Adress_To_Neighbors(uint32_t global_address,
                                     uint16_t local_address,
                                     e32_t *radio,
@@ -2978,6 +3502,8 @@ bool Send_Local_Adress_To_Neighbors(uint32_t global_address,
     return sent;
 }
 
+/* Used when a node is being removed from the mesh: tell every neighbour to
+ * drop us from their local_neighbors.txt. */
 bool Remove_Local_Address_From_Neighbors(uint32_t global_address,
                                          e32_t *radio,
                                          ftp_client_t *ftp)
@@ -3030,6 +3556,11 @@ bool Remove_Local_Address_From_Neighbors(uint32_t global_address,
     return sent;
 }
 
+/* Receiving side of RADIO_CMD_SEND_LOCAL_ADRESS.
+ *
+ * Two cases: the neighbour is already in our list (update its address) or it
+ * is new (append it). Both end in the same rewrite-and-upload block, reached
+ * with a goto so the upload code exists exactly once. */
 bool Respond_To_Local_Address(uint32_t global_address,
                               e32_t *radio,
                               ftp_client_t *ftp,
@@ -3056,6 +3587,7 @@ bool Respond_To_Local_Address(uint32_t global_address,
     uint8_t neighbor_count = 0;
     bool has_neighbors = radio_parse_neighbor_file(neighbors, &neighbor_count);
 
+    /* Look for the neighbour we were told about. */
     for (uint8_t i = 0; has_neighbors && i < neighbor_count; ++i)
     {
         if (neighbors[i].global_address == request->source)
@@ -3075,6 +3607,9 @@ bool Respond_To_Local_Address(uint32_t global_address,
     neighbors[neighbor_count].local_address = local_address;
     ++neighbor_count;
 
+/* Rewrite the whole list back to text and upload it. The file is always
+ * replaced, never patched: at 8 entries that is cheaper and safer than
+ * trying to splice bytes. */
 upload_neighbors:
     {
         uint8_t output[sizeof(neighbor_file)];
@@ -3100,6 +3635,8 @@ upload_neighbors:
     }
 }
 
+/* Receiving side of RADIO_CMD_REMOVE_LOCAL_ADDRESS: drop one row from our
+ * neighbour file. An empty file is legal, so 'nothing to remove' is success. */
 bool Respond_To_Local_Address_Removal(uint32_t global_address,
                                       e32_t *radio,
                                       ftp_client_t *ftp,
@@ -3129,6 +3666,8 @@ bool Respond_To_Local_Address_Removal(uint32_t global_address,
         return false;
     }
 
+    /* Compact the array in place, keeping everything that is not the node
+     * being removed. Same idiom as the graph row compaction. */
     uint8_t retained_count = 0;
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
@@ -3136,6 +3675,7 @@ bool Respond_To_Local_Address_Removal(uint32_t global_address,
             neighbors[retained_count++] = neighbors[i];
     }
 
+    /* Nothing changed: do not touch the file on the server. */
     if (retained_count == neighbor_count)
         return true;
 
@@ -3162,6 +3702,10 @@ bool Respond_To_Local_Address_Removal(uint32_t global_address,
 }
 
 
+/* The most involved responder: one packet causes three separate edits -
+ * the graph, our own neighbour file, and a relay to our neighbours. Doing all
+ * three here is what makes a departure visible everywhere in the mesh, not
+ * just to the node that heard about it. */
 bool Respond_To_Node_Removal(uint32_t global_address,
                              e32_t *radio,
                              ftp_client_t *ftp,
@@ -3174,6 +3718,7 @@ bool Respond_To_Node_Removal(uint32_t global_address,
         return false;
 
     uint32_t removed_address = request->source;
+    /* Termination of the wave, same guard as in Relay_Node_Removal. */
     if (radio_node_removal_seen(removed_address))
         return true;
 
@@ -3197,6 +3742,7 @@ bool Respond_To_Node_Removal(uint32_t global_address,
 
     radio_mark_node_removal_seen(removed_address);
 
+    /* Relay to everyone except the node that is gone and except ourselves. */
     bool sent = true;
     for (uint8_t i = 0; i < neighbor_count; ++i)
     {
@@ -3222,6 +3768,9 @@ bool Respond_To_Node_Removal(uint32_t global_address,
         }
     }
 
+    /* Reuse the same packet with a different command to clean our own
+     * neighbour file: the payload is empty in both cases, so only the
+     * command has to change. */
     radio_packet_t local_removal = *request;
     local_removal.command = RADIO_CMD_REMOVE_LOCAL_ADDRESS;
     bool local_removed = Respond_To_Local_Address_Removal(global_address,
@@ -3236,6 +3785,7 @@ bool Respond_To_Node_Removal(uint32_t global_address,
         return false;
     }
 
+    /* And finally delete the node from our copy of the global graph. */
     bool ledger_changed = false;
     radio_remove_global_connection_node(removed_address, &ledger_changed);
     if (ledger_changed &&
@@ -3252,8 +3802,16 @@ bool Respond_To_Node_Removal(uint32_t global_address,
     return sent && local_removed;
 }
 
+/* The single E32 device instance, declared 'extern e32_t radio' in radio.h so
+ * that handlers can take &radio. main() initialises it in second_core_code().
+ * It sits at the end of the file so it is defined after every function that
+ * refers to it. */
 e32_t radio;
 
+/* Leg 1 of the DH exchange, run by the node that wants a secret with a
+ * distant node. It is the only place in the program where a fresh DH group is
+ * created, and the private value is parked in dh_pending_* until the reply
+ * arrives - that is the entire state machine for the exchange. */
 bool Create_DH_Exchange_Packet(uint32_t target_global_address,
                                uint32_t personal_global_address,
                                const uint32_t *route,
@@ -3289,6 +3847,10 @@ bool Create_DH_Exchange_Packet(uint32_t target_global_address,
     uint8_t message[RADIO_DH_MESSAGE_SIZE];
     uint8_t signed_request[RADIO_DH_SIGNED_REQUEST_SIZE];
 
+    /* Build a safe 1023-bit prime p. Forcing the top and bottom bits keeps
+     * the candidate in the right range and odd, so generate_random_prime_number
+     * has less to search. The loop repeats until the result really is 1023
+     * bits, because rounding up can cross a bit boundary. */
     do
     {
         generate_random_seed(seed, 256);
