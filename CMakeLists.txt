@@ -60,8 +60,12 @@ target_link_libraries(ethernet_setup
 add_executable(mesh_network_v1
     mesh_network_v1.c
     Radio/ebyte_e32.c
+    Radio/radio.c
     Radio/radio_packet_protocol.c
     Ethernet_FTP/ftp_client.c
+    Cryptographic_Functions/Cryptographic_Functions.c
+    Cryptographic_Functions/chacha20_drng.c
+    Cryptographic_Functions/mini-gmp.c
 )
 
 pico_set_program_name(mesh_network_v1 "mesh_network_v1")
@@ -86,6 +90,8 @@ target_link_libraries(mesh_network_v1
 # Add the standard include files to the build
 target_include_directories(mesh_network_v1 PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/Radio
+        ${CMAKE_CURRENT_LIST_DIR}/Cryptographic_Functions
 )
 
 pico_add_extra_outputs(mesh_network_v1)

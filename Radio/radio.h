@@ -62,8 +62,7 @@ bool Respond_To_Global_Connections_Request(uint32_t global_address,
 
 bool Request_Global_RSA_Keys(uint32_t global_address,
                              e32_t *radio,
-                             ftp_client_t *ftp,
-                             const radio_packet_t *request);
+                             ftp_client_t *ftp);
 
 bool Respond_To_Global_RSA_Keys_Request(uint32_t global_address,
                                        e32_t *radio,
