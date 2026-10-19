@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Post Office</title>
+
+<style>
+:root {
+    --black: #0b0a08;
+    --panel: #15120e;
+    --panel-light: #211910;
+    --brown: #382719;
+    --gold: #b58a4c;
+    --gold-light: #dfbd80;
+    --border: #594027;
+    --text: #d4c4a5;
+    --muted: #8d7c63;
+    --red: #642c22;
+    --green: #244d2d;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--black);
+    color: var(--text);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 14px;
+}
+
+/* HEADER */
+
+header {
+    padding: 20px 26px;
+    background: #100d09;
+    border-bottom: 2px solid var(--gold);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.brand h1 {
+    margin: 0;
+    color: var(--gold-light);
+    font-size: clamp(26px, 4vw, 38px);
+    font-weight: normal;
+    letter-spacing: 1px;
+    font-variant: small-caps;
+}
+
+.brand p {
+    margin: 5px 0 0;
+    color: var(--muted);
+    font-style: italic;
+}
+
+nav {
+    display: flex;
+    gap: 6px;
+}
+
+nav button {
+    padding: 10px 16px;
+    color: var(--gold-light);
+    background: transparent;
+    border: 1px solid var(--border);
+    font: inherit;
+    cursor: pointer;
+}
+
+nav button:hover {
+    background: var(--brown);
+    border-color: var(--gold);
+}
+
+/* MAIN LAYOUT */
+
+.layout {
+    display: grid;
+    grid-template-columns: 210px minmax(0, 1fr);
+    min-height: calc(100vh - 110px);
+}
+
+/* SIDEBAR */
+
+.sidebar {
+    padding: 20px 12px;
+    background: #100e0b;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+}
+
+.compose-shortcut {
+    padding: 12px;
+    margin-bottom: 28px;
+    background: var(--brown);
+    border: 1px solid var(--gold);
+    color: var(--gold-light);
+    font: inherit;
+    cursor: pointer;
+}
+
+.compose-shortcut:hover {
+    background: #4a3421;
+}
+
+.sidebar-heading {
+    padding: 9px;
+    margin-bottom: 8px;
+    color: var(--gold);
+    border-bottom: 1px solid var(--border);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-size: 11px;
+}
+
+.folder {
+    padding: 12px 10px;
+    margin-bottom: 3px;
+    color: var(--text);
+    cursor: pointer;
+    border-left: 3px solid transparent;
+}
+
+.folder:hover {
+    background: var(--panel-light);
+}
+
+.folder.active {
+    background: #291c13;
+    border-left-color: var(--gold);
+    color: var(--gold-light);
+}
+
+.sidebar-note {
+    margin-top: auto;
+    padding: 16px 5px;
+    color: var(--muted);
+    font-size: 12px;
+    font-style: italic;
+    line-height: 1.8;
+    text-align: center;
+    border-top: 1px solid var(--border);
+}
+
+/* MAIN CONTENT */
+
+.main {
+    min-width: 0;
+    padding: 22px;
+}
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    margin-bottom: 20px;
+}
+
+.panel-heading {
+    padding: 14px 17px;
+    background: #21180f;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+}
+
+.panel-heading h2 {
+    margin: 0;
+    color: var(--gold-light);
+    font-size: 22px;
+    font-weight: normal;
+    font-variant: small-caps;
+}
+
+.message-count {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* INBOX */
+
+.email-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    padding: 14px 17px;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    border-bottom: 1px solid #302419;
+    font-family: inherit;
+    font-size: 14px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.email-row:hover {
+    background: #211a12;
+}
+
+.email-row.selected {
+    background: #332116;
+    box-shadow: inset 3px 0 var(--gold);
+}
+
+.email-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.email-sender {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--gold-light);
+    font-size: 15px;
+}
+
+.email-preview {
+    display: block;
+    overflow: hidden;
+    color: var(--muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.email-number {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.empty-inbox {
+    padding: 35px 20px;
+    color: var(--muted);
+    text-align: center;
+    line-height: 1.8;
+}
+
+/* MESSAGE VIEWER */
+
+.viewer-header {
+    padding: 20px;
+    border-bottom: 1px solid var(--border);
+    background: #19130e;
+}
+
+.viewer-subject {
+    margin: 0 0 18px;
+    color: var(--gold-light);
+    font-size: 23px;
+    font-weight: normal;
+}
+
+.viewer-sender {
+    color: var(--muted);
+    line-height: 1.8;
+}
+
+.viewer-sender strong {
+    color: var(--gold-light);
+    font-weight: normal;
+}
+
+.viewer-body {
+    min-height: 180px;
+    padding: 25px 20px;
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.9;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.viewer-placeholder {
+    padding: 45px 20px;
+    color: var(--muted);
+    text-align: center;
+    font-style: italic;
+}
+
+/* COMPOSE WINDOW */
+
+.compose-window {
+    position: fixed;
+    right: 24px;
+    bottom: 0;
+    width: 360px;
+    max-width: calc(100vw - 24px);
+    background: var(--panel);
+    border: 1px solid var(--gold);
+    border-bottom: none;
+    box-shadow: 0 0 24px #000;
+    z-index: 10;
+}
+
+.compose-titlebar {
+    padding: 13px 15px;
+    background: #291c12;
+    border-bottom: 1px solid var(--gold);
+    color: var(--gold-light);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 17px;
+}
+
+.compose-titlebar button {
+    background: none;
+    border: none;
+    color: var(--gold-light);
+    font-size: 20px;
+    cursor: pointer;
+}
+
+.compose-content {
+    padding: 16px;
+}
+
+.compose-content label {
+    display: block;
+    margin-bottom: 7px;
+    color: var(--gold);
+}
+
+.compose-content input,
+.compose-content textarea {
+    display: block;
+    width: 100%;
+    margin-bottom: 16px;
+    padding: 10px;
+    background: #0c0a08;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 13px;
+}
+
+.compose-content input:focus,
+.compose-content textarea:focus {
+    outline: 1px solid var(--gold);
+}
+
+.compose-content textarea {
+    height: 120px;
+    resize: vertical;
+}
+
+.compose-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+}
+
+.send-button {
+    padding: 10px 24px;
+    background: var(--green);
+    border: 1px solid #63834a;
+    color: #e1dfc2;
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.send-button:hover {
+    background: #32633a;
+}
+
+.compose-hint {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.compose-collapsed .compose-content {
+    display: none;
+}
+
+/* FOOTER */
+
+footer {
+    padding: 18px;
+    padding-right: 390px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+}
+
+/* MOBILE */
+
+@media (max-width: 650px) {
+    header {
+        padding: 16px;
+    }
+
+    .layout {
+        grid-template-columns: 115px minmax(0, 1fr);
+    }
+
+    .sidebar {
+        padding: 12px 6px;
+    }
+
+    .main {
+        padding: 10px 6px;
+    }
+
+    .email-row {
+        padding: 12px 7px;
+        gap: 7px;
+    }
+
+    .email-number {
+        display: none;
+    }
+
+    .compose-window {
+        right: 8px;
+        width: 320px;
+    }
+
+    footer {
+        padding-right: 18px;
+    }
+
+    nav button {
+        padding: 8px;
+        font-size: 12px;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    <div class="brand">
+        <h1>The Post Office</h1>
+        <p>Messages travel far, even in the darkest times.</p>
+    </div>
+
+    <nav>
+        <button onclick="showFolder('inbox')">Home</button>
+        <button onclick="loadMessages()">Refresh</button>
+        <button onclick="openCompose()">Compose</button>
+    </nav>
+</header>
+
+<div class="layout">
+
+    <aside class="sidebar">
+        <button class="compose-shortcut" onclick="openCompose()">
+            Compose Letter
+        </button>
+
+        <div class="sidebar-heading">Mailbox</div>
+
+        <div class="folder active" id="inboxFolder"
+             onclick="showFolder('inbox')">
+            Inbox
+        </div>
+
+        <div class="folder" id="allFolder"
+             onclick="showFolder('all')">
+            All Messages
+        </div>
+
+        <div class="sidebar-note">
+            Better to send a message than to keep it in your heart.
+        </div>
+    </aside>
+
+    <main class="main">
+
+        <section class="panel">
+            <div class="panel-heading">
+                <h2 id="listTitle">Inbox</h2>
+                <span class="message-count" id="messageCount">
+                    Loading...
+                </span>
+            </div>
+
+            <div id="emailList">
+                <div class="empty-inbox">Loading messages...</div>
+            </div>
+        </section>
+
+        <section class="panel" id="messageViewer">
+            <div class="viewer-placeholder">
+                Select a sender to read their letter.
+            </div>
+        </section>
+
+    </main>
+
+</div>
+
+<footer>
+    The Post Office · Established in an age long forgotten
+</footer>
+
+<!-- COMPOSE WINDOW -->
+
+<div class="compose-window" id="composeWindow">
+
+    <div class="compose-titlebar">
+        <span>New Letter</span>
+        <button type="button" title="Minimize"
+                onclick="toggleCompose()">−</button>
+    </div>
+
+    <div class="compose-content" id="composeContent">
+        <form id="composeForm">
+
+            <label for="recipient">To whom it may concern:</label>
+            <input id="recipient" type="text" maxlength="100"
+                   placeholder="Recipient's username"
+                   autocomplete="off">
+
+            <label for="composeMessage">Your letter:</label>
+            <textarea id="composeMessage" maxlength="5000"
+                      placeholder="Write your message..."></textarea>
+
+            <div class="compose-actions">
+                <button class="send-button" type="submit">Send</button>
+                <span class="compose-hint">Not yet dispatched</span>
+            </div>
+
+        </form>
+    </div>
+
+</div>
+
+<script>
+let messages = [];
+let selectedMessage = null;
+let currentFolder = "inbox";
+
+async function loadMessages() {
+    const list = document.getElementById("emailList");
+
+    list.innerHTML =
+        '<div class="empty-inbox">Fetching the letters...</div>';
+
+    try {
+        const response = await fetch("current_discussion.txt", {
+            cache: "no-store"
+        });
+
+        if (!response.ok) {
+            throw new Error("HTTP " + response.status);
+        }
+
+        const text = await response.text();
+
+        messages = text.split(/\r?\n/)
+            .map((line, index) => {
+                const separator = line.indexOf(":");
+
+                if (separator === -1) return null;
+
+                const sender = line.slice(0, separator).trim();
+                const body = line.slice(separator + 1).trim();
+
+                if (!sender) return null;
+
+                return {
+                    sender: sender,
+                    body: body,
+                    id: index
+                };
+            })
+            .filter(message => message !== null);
+
+        selectedMessage = null;
+        renderInbox();
+
+        if (messages.length > 0) {
+            selectMessage(messages[0].id);
+        } else {
+            showEmptyViewer();
+        }
+
+    } catch (error) {
+        list.innerHTML = "";
+
+        const errorMessage = document.createElement("div");
+        errorMessage.className = "empty-inbox";
+        errorMessage.textContent =
+            "The letters could not be retrieved. " +
+            "Ensure current_discussion.txt is beside index.html. " +
+            error.message;
+
+        list.appendChild(errorMessage);
+
+        document.getElementById("messageCount").textContent = "Error";
+
+        showEmptyViewer();
+    }
+}
+
+function renderInbox() {
+    const list = document.getElementById("emailList");
+
+    document.getElementById("messageCount").textContent =
+        messages.length + " letters";
+
+    document.getElementById("listTitle").textContent =
+        currentFolder === "all" ? "All Messages" : "Inbox";
+
+    document.getElementById("inboxFolder")
+        .classList.toggle("active", currentFolder === "inbox");
+
+    document.getElementById("allFolder")
+        .classList.toggle("active", currentFolder === "all");
+
+    if (messages.length === 0) {
+        list.innerHTML =
+            '<div class="empty-inbox">No letters have arrived.</div>';
+        return;
+    }
+
+    list.innerHTML = "";
+
+    messages.forEach((message, index) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "email-row";
+
+        if (selectedMessage && selectedMessage.id === message.id) {
+            row.classList.add("selected");
+        }
+
+        const info = document.createElement("span");
+        info.className = "email-info";
+
+        const sender = document.createElement("span");
+        sender.className = "email-sender";
+        sender.textContent = message.sender;
+
+        const preview = document.createElement("span");
+        preview.className = "email-preview";
+        preview.textContent = message.body || "(Empty letter)";
+
+        const number = document.createElement("span");
+        number.className = "email-number";
+        number.textContent = "#" + (index + 1);
+
+        info.appendChild(sender);
+        info.appendChild(preview);
+
+        row.appendChild(info);
+        row.appendChild(number);
+
+        row.addEventListener("click", () => selectMessage(message.id));
+
+        list.appendChild(row);
+    });
+}
+
+function selectMessage(id) {
+    const message = messages.find(item => item.id === id);
+    if (!message) return;
+
+    selectedMessage = message;
+    renderInbox();
+
+    const viewer = document.getElementById("messageViewer");
+    viewer.innerHTML = "";
+
+    const heading = document.createElement("div");
+    heading.className = "viewer-header";
+
+    const subject = document.createElement("h3");
+    subject.className = "viewer-subject";
+    subject.textContent = "A Letter from " + message.sender;
+
+    const senderInfo = document.createElement("div");
+    senderInfo.className = "viewer-sender";
+
+    const senderLabel = document.createElement("strong");
+    senderLabel.textContent = message.sender;
+
+    senderInfo.appendChild(senderLabel);
+    heading.appendChild(subject);
+    heading.appendChild(senderInfo);
+
+    const body = document.createElement("div");
+    body.className = "viewer-body";
+    body.textContent = message.body || "(Empty letter)";
+
+    viewer.appendChild(heading);
+    viewer.appendChild(body);
+}
+
+function showEmptyViewer() {
+    selectedMessage = null;
+
+    document.getElementById("messageViewer").innerHTML = "";
+
+    const placeholder = document.createElement("div");
+    placeholder.className = "viewer-placeholder";
+    placeholder.textContent = "No letter selected.";
+
+    document.getElementById("messageViewer").appendChild(placeholder);
+}
+
+function showFolder(folder) {
+    currentFolder = folder;
+    renderInbox();
+
+    if (messages.length > 0 && !selectedMessage) {
+        selectMessage(messages[0].id);
+    }
+}
+
+function openCompose() {
+    document.getElementById("composeWindow")
+        .classList.remove("compose-collapsed");
+
+    document.getElementById("recipient").focus();
+}
+
+function toggleCompose() {
+    document.getElementById("composeWindow")
+        .classList.toggle("compose-collapsed");
+}
+
+document.getElementById("composeForm").addEventListener(
+    "submit",
+    function(event) {
+        event.preventDefault();
+
+        // Placeholder: no message is sent or saved yet.
+    }
+);
+
+loadMessages();
+</script>
+
+</body>
+</html>

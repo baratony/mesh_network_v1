@@ -1,6 +1,367 @@
-<html>
-    <body>
-        <h1 style="text-align: center;"> Welcome to the Discussion Hall</h1>
-        
-    </body>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Discussion Hall</title>
+
+    <style>
+        :root {
+            --black: #0b0a08;
+            --panel: #15120e;
+            --panel-light: #211910;
+            --brown: #382719;
+            --gold: #b58a4c;
+            --gold-light: #dfbd80;
+            --border: #594027;
+            --text: #d4c4a5;
+            --muted: #8d7c63;
+            --green: #244d2d;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: var(--black);
+            color: var(--text);
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 14px;
+        }
+
+        header {
+            padding: 20px 26px;
+            background: #100d09;
+            border-bottom: 2px solid var(--gold);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .brand h1 {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: clamp(26px, 4vw, 38px);
+            font-weight: normal;
+            letter-spacing: 1px;
+            font-variant: small-caps;
+        }
+
+        .brand p {
+            margin: 5px 0 0;
+            color: var(--muted);
+            font-style: italic;
+        }
+
+        nav {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        nav a {
+            padding: 10px 16px;
+            color: var(--gold-light);
+            background: transparent;
+            border: 1px solid var(--border);
+            font: inherit;
+            text-decoration: none;
+        }
+
+        nav a:hover {
+            background: var(--brown);
+            border-color: var(--gold);
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 210px minmax(0, 1fr);
+            min-height: calc(100vh - 110px);
+        }
+
+        .sidebar {
+            padding: 20px 12px;
+            background: #100e0b;
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar-heading {
+            padding: 9px;
+            margin-bottom: 8px;
+            color: var(--gold);
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            font-size: 11px;
+        }
+
+        .side-link {
+            display: block;
+            padding: 12px 10px;
+            margin-bottom: 3px;
+            color: var(--text);
+            border-left: 3px solid transparent;
+            text-decoration: none;
+        }
+
+        .side-link:hover,
+        .side-link.active {
+            background: #291c13;
+            border-left-color: var(--gold);
+            color: var(--gold-light);
+        }
+
+        .sidebar-note {
+            margin-top: auto;
+            padding: 16px 5px;
+            color: var(--muted);
+            font-size: 12px;
+            font-style: italic;
+            line-height: 1.8;
+            text-align: center;
+            border-top: 1px solid var(--border);
+        }
+
+        main {
+            min-width: 0;
+            padding: 22px 22px 180px;
+        }
+
+        .panel {
+            margin-bottom: 20px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+        }
+
+        .panel-heading {
+            padding: 14px 17px;
+            background: #21180f;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-heading h2 {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: 22px;
+            font-weight: normal;
+            font-variant: small-caps;
+        }
+
+        #messages {
+            min-height: 220px;
+            margin: 0;
+            padding: 22px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 15px;
+            line-height: 1.9;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .compose-window {
+            position: fixed;
+            right: 24px;
+            bottom: 0;
+            width: 460px;
+            max-width: calc(100vw - 24px);
+            background: var(--panel);
+            border: 1px solid var(--gold);
+            border-bottom: none;
+            box-shadow: 0 0 24px #000;
+            z-index: 10;
+        }
+
+        .compose-titlebar {
+            padding: 13px 15px;
+            background: #291c12;
+            border-bottom: 1px solid var(--gold);
+            color: var(--gold-light);
+            font-size: 17px;
+        }
+
+        .compose-content {
+            display: flex;
+            gap: 8px;
+            padding: 14px;
+        }
+
+        #message {
+            flex: 1;
+            min-width: 0;
+            padding: 10px;
+            background: #0c0a08;
+            border: 1px solid var(--border);
+            color: var(--text);
+            font: inherit;
+        }
+
+        #message:focus {
+            outline: 1px solid var(--gold);
+        }
+
+        .send-button {
+            padding: 10px 20px;
+            background: var(--green);
+            border: 1px solid #63834a;
+            color: #e1dfc2;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        .send-button:hover {
+            background: #32633a;
+        }
+
+        .compose-hint {
+            padding: 0 14px 13px;
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        footer {
+            padding: 18px;
+            padding-right: 500px;
+            border-top: 1px solid var(--border);
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        @media (max-width: 650px) {
+            header {
+                padding: 16px;
+            }
+
+            .layout {
+                grid-template-columns: 115px minmax(0, 1fr);
+            }
+
+            .sidebar {
+                padding: 12px 6px;
+            }
+
+            main {
+                padding: 10px 6px 180px;
+            }
+
+            #messages {
+                padding: 16px 12px;
+            }
+
+            .compose-window {
+                right: 8px;
+                width: 320px;
+            }
+
+            footer {
+                padding-right: 18px;
+            }
+
+            nav a {
+                padding: 8px;
+                font-size: 12px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div class="brand">
+            <h1>The Discussion Hall</h1>
+            <p>Gather, speak, and listen across the network.</p>
+        </div>
+
+        <nav aria-label="Main navigation">
+            <a href="/index.html">Home</a>
+            <a href="/Post_Office/Post_Office.html">Post Office</a>
+        </nav>
+    </header>
+
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="sidebar-heading">Community</div>
+            <a class="side-link active" href="/Discussion_Hall/Discussion_Hall.html" aria-current="page">Discussion Hall</a>
+            <a class="side-link" href="/Post_Office/Post_Office.html">Post Office</a>
+            <a class="side-link" href="/Kings_Court/Kings_Court.html">Curia Regis</a>
+            <div class="sidebar-note">Messages are shown from the local discussion record.</div>
+        </aside>
+
+        <main>
+            <section class="panel">
+                <div class="panel-heading">
+                    <h2>Current Discussion</h2>
+                </div>
+                <pre id="messages" aria-live="polite">Loading messages...</pre>
+            </section>
+        </main>
+    </div>
+
+    <footer>The Discussion Hall · Speak freely, listen closely</footer>
+
+    <section class="compose-window" aria-label="Send a message">
+        <div class="compose-titlebar">Add to the Discussion</div>
+        <form class="compose-content" id="messageForm">
+            <input
+                id="message"
+                type="text"
+                maxlength="200"
+                placeholder="Type a message..."
+                aria-label="Message"
+                autocomplete="off"
+            >
+            <button class="send-button" type="submit">Send</button>
+        </form>
+        <div class="compose-hint">Messages appear here locally and are not saved to the text file.</div>
+    </section>
+
+    <script>
+        fetch("current_discussion.txt")
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error("Could not load the text file.");
+                }
+
+                return response.text();
+            })
+            .then(text => {
+                document.getElementById("messages").textContent = text;
+            })
+            .catch(error => {
+                document.getElementById("messages").textContent =
+                    "Error loading messages: " + error.message;
+            });
+
+        function sendMessage(event) {
+            event.preventDefault();
+
+            const input = document.getElementById("message");
+            const message = input.value.trim();
+
+            if (message === "") {
+                return;
+            }
+
+            const messages = document.getElementById("messages");
+
+            messages.textContent +=
+                (messages.textContent ? "\n" : "") +
+                "you: " + message;
+
+            input.value = "";
+        }
+
+        document.getElementById("messageForm").addEventListener(
+            "submit",
+            sendMessage
+        );
+    </script>
+</body>
 </html>

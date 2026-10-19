@@ -1,89 +1,366 @@
-<html>
-    <body> 
-        <h1 style="text-align: center;"> Welcome Back to Domostroi, User //place holder//</h1>
-        <h3 style="text-align: center;"> //place holder// letters where sent to you in the last 48 hours </h3>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Domostroi</title>
 
+    <style>
+        :root {
+            --black: #0b0a08;
+            --panel: #15120e;
+            --panel-light: #211910;
+            --brown: #382719;
+            --gold: #b58a4c;
+            --gold-light: #dfbd80;
+            --border: #594027;
+            --text: #d4c4a5;
+            --muted: #8d7c63;
+        }
 
-        <div style="display: flex; justify-content: space-around; width: 100%;">
+        * {
+            box-sizing: border-box;
+        }
 
-        <a href="/Discussion_Hall/Discussion_Hall.html">
-            <button style="text-align: right; font-family:'Times New Roman', Times, serif;padding: 12px 24px;font-size: 24px; color:crimson; background-color: cadetblue;border-radius: 5px;"> Enter Discussion Hall </button>
-        </a>
+        body {
+            margin: 0;
+            background: var(--black);
+            color: var(--text);
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 14px;
+        }
 
-        <a href="Post_Office/Post_Office.html">
-            <button style="text-align: right; font-family:'Times New Roman', Times, serif;padding: 12px 24px;font-size: 24px; color:crimson; background-color: cadetblue;border-radius: 5px;"> Enter Post Office </button>
-        </a>
+        header {
+            padding: 20px 26px;
+            background: #100d09;
+            border-bottom: 2px solid var(--gold);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
 
+        .brand h1 {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: clamp(26px, 4vw, 38px);
+            font-weight: normal;
+            letter-spacing: 1px;
+            font-variant: small-caps;
+        }
+
+        .brand p {
+            margin: 5px 0 0;
+            color: var(--muted);
+            font-style: italic;
+        }
+
+        nav {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        nav a,
+        .action-link {
+            padding: 10px 16px;
+            color: var(--gold-light);
+            background: transparent;
+            border: 1px solid var(--border);
+            font: inherit;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        nav a:hover,
+        .action-link:hover {
+            background: var(--brown);
+            border-color: var(--gold);
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 210px minmax(0, 1fr);
+            min-height: calc(100vh - 110px);
+        }
+
+        .sidebar {
+            padding: 20px 12px;
+            background: #100e0b;
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar-heading {
+            padding: 9px;
+            margin-bottom: 8px;
+            color: var(--gold);
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            font-size: 11px;
+        }
+
+        .side-link {
+            display: block;
+            padding: 12px 10px;
+            margin-bottom: 3px;
+            color: var(--text);
+            border-left: 3px solid transparent;
+            text-decoration: none;
+        }
+
+        .side-link:hover,
+        .side-link.active {
+            background: #291c13;
+            border-left-color: var(--gold);
+            color: var(--gold-light);
+        }
+
+        .sidebar-note {
+            margin-top: auto;
+            padding: 16px 5px;
+            color: var(--muted);
+            font-size: 12px;
+            font-style: italic;
+            line-height: 1.8;
+            text-align: center;
+            border-top: 1px solid var(--border);
+        }
+
+        main {
+            min-width: 0;
+            padding: 22px;
+        }
+
+        .panel {
+            margin-bottom: 20px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+        }
+
+        .panel-heading {
+            padding: 14px 17px;
+            background: #21180f;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-heading h2 {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: 22px;
+            font-weight: normal;
+            font-variant: small-caps;
+        }
+
+        .panel-body {
+            padding: 18px;
+        }
+
+        .welcome {
+            color: var(--text);
+            font-size: 15px;
+            line-height: 1.8;
+        }
+
+        .welcome strong {
+            color: var(--gold-light);
+            font-weight: normal;
+        }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 16px;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 20px;
+        }
+
+        .neighbor-list {
+            margin: 0;
+            padding: 5px 0 5px 22px;
+            line-height: 1.8;
+        }
+
+        .neighbor-list li {
+            margin-bottom: 6px;
+        }
+
+        .stat-value {
+            margin: 8px 0 0;
+            color: var(--gold-light);
+            font-size: 28px;
+            font-variant: small-caps;
+        }
+
+        .stats-list {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+            margin: 0;
+        }
+
+        .stats-list div {
+            padding: 14px;
+            background: var(--panel-light);
+            border: 1px solid #302419;
+        }
+
+        .stats-list dt {
+            color: var(--muted);
+            margin-bottom: 7px;
+        }
+
+        .stats-list dd {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: 18px;
+        }
+
+        footer {
+            padding: 18px;
+            border-top: 1px solid var(--border);
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        @media (max-width: 650px) {
+            header {
+                padding: 16px;
+            }
+
+            .layout {
+                grid-template-columns: 115px minmax(0, 1fr);
+            }
+
+            .sidebar {
+                padding: 12px 6px;
+            }
+
+            main {
+                padding: 10px 6px;
+            }
+
+            .dashboard-grid,
+            .stats-list {
+                grid-template-columns: 1fr;
+            }
+
+            .panel-body {
+                padding: 13px;
+            }
+
+            nav a {
+                padding: 8px;
+                font-size: 12px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div class="brand">
+            <h1>Domostroi</h1>
+            <p>A home among the connected nodes.</p>
         </div>
 
+        <nav aria-label="Main navigation">
+            <a href="/Discussion_Hall/Discussion_Hall.html">Discussion Hall</a>
+            <a href="/Post_Office/Post_Office.html">Post Office</a>
+        </nav>
+    </header>
 
-        <div style="display: flex; justify-content: space-around; width: 100%;">
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="sidebar-heading">Your Network</div>
+            <a class="side-link active" href="/index.html" aria-current="page">Home</a>
+            <a class="side-link" href="/Discussion_Hall/Discussion_Hall.html">Discussion Hall</a>
+            <a class="side-link" href="/Post_Office/Post_Office.html">Post Office</a>
+            <a class="side-link" href="/Kings_Court/Kings_Court.html">Curia Regis</a>
+            <div class="sidebar-note">A quiet place to keep watch over the network.</div>
+        </aside>
 
-            <div>
-            <h2> Local Neighbors: //Place Holder//</h2>
-                <ul> 
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                    <li> //Place Holder//
-                </ul>
+        <main>
+            <section class="panel">
+                <div class="panel-heading">
+                    <h2>Welcome Back</h2>
+                </div>
+                <div class="panel-body welcome">
+                    <p>Welcome back to Domostroi, <strong>User //place holder//</strong>.</p>
+                    <p><strong>//place holder//</strong> letters were sent to you in the last 48 hours.</p>
+                    <div class="actions">
+                        <a class="action-link" href="/Discussion_Hall/Discussion_Hall.html">Enter Discussion Hall</a>
+                        <a class="action-link" href="/Post_Office/Post_Office.html">Enter Post Office</a>
+                    </div>
+                </div>
+            </section>
+
+            <div class="dashboard-grid">
+                <section class="panel">
+                    <div class="panel-heading">
+                        <h2>Local Neighbors</h2>
+                    </div>
+                    <div class="panel-body">
+                        <ul class="neighbor-list">
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                            <li>//Place Holder//</li>
+                        </ul>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-heading">
+                        <h2>Total Reachable Nodes</h2>
+                    </div>
+                    <div class="panel-body">
+                        <p class="stat-value">//Place Holder//</p>
+                    </div>
+                </section>
             </div>
 
-            <h2> Total Reachable Nodes: //Place Holder//</h2>
+            <section class="panel">
+                <div class="panel-heading">
+                    <h2>Network Stats</h2>
+                </div>
+                <div class="panel-body">
+                    <dl class="stats-list">
+                        <div>
+                            <dt>Storage Left</dt>
+                            <dd>//Place Holder// GB</dd>
+                        </div>
+                        <div>
+                            <dt>Processor Speed</dt>
+                            <dd>//Place Holder// MHz</dd>
+                        </div>
+                        <div>
+                            <dt>Current Data Rate</dt>
+                            <dd>//Place Holder// KBS</dd>
+                        </div>
+                        <div>
+                            <dt>RSA Key Length</dt>
+                            <dd>//Place Holder// Bits</dd>
+                        </div>
+                    </dl>
+                </div>
+            </section>
+        </main>
+    </div>
 
-        </div>
-
-        <div style="display: flex; justify-content: space-around; width: 100%;">
-        <h2> Stats:</h2>
-        </div>
-
-        <div style="display: flex; justify-content: space-around; width: 100%;">
-
-            <style>
-            li {
-                margin-bottom: 10px; /* Adjust this value to increase or decrease space */
-            }
-
-            ul {
-            font-family: 'Times New Roman', sans-serif;
-            font-size: 15px;
-            }
-
-            </style>
-
-            <ul> 
-                <li> Storage Left: //Place Holder// GB
-                <li> Proccesor Speed: //Place Holder// MHZ
-                <li>
-                <li>
-                <li>
-                <li>
-                <li>
-                <li>
-            </ul>
-
-            <ul> 
-                <li> Current Data Rate: //Place Holder// KBS
-                <li> RSA Key Length //Place Holder// Bits
-                <li>
-                <li>
-                <li>
-                <li>
-                <li>
-                <li>
-            </ul>
-
-        </div>
-
-        <div style="display: flex; justify-content: space-around; width: 100%;">
-        <a href="Kings_Court/Kings_Court.html">
-            <button style="text-align: right; font-family:'Times New Roman', Times, serif;padding: 8px 16px;font-size: 20px; color:crimson; background-color: rgb(0, 0, 0);border-radius: 5px;"> Curia Regis </button>
-        </a>
-        </div>
-
-    </body>
+    <footer>Domostroi · A home among the connected nodes</footer>
+</body>
 </html>

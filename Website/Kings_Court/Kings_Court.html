@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Curia Regis</title>
+
+    <style>
+        :root {
+            --black: #0b0a08;
+            --panel: #15120e;
+            --brown: #382719;
+            --gold: #b58a4c;
+            --gold-light: #dfbd80;
+            --border: #594027;
+            --text: #d4c4a5;
+            --muted: #8d7c63;
+            --red: #642c22;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: var(--black);
+            color: var(--text);
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 14px;
+        }
+
+        header {
+            padding: 20px 26px;
+            background: #100d09;
+            border-bottom: 2px solid var(--gold);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .brand h1 {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: clamp(26px, 4vw, 38px);
+            font-weight: normal;
+            letter-spacing: 1px;
+            font-variant: small-caps;
+        }
+
+        .brand p {
+            margin: 5px 0 0;
+            color: var(--muted);
+            font-style: italic;
+        }
+
+        nav {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        nav a {
+            padding: 10px 16px;
+            color: var(--gold-light);
+            background: transparent;
+            border: 1px solid var(--border);
+            font: inherit;
+            text-decoration: none;
+        }
+
+        nav a:hover {
+            background: var(--brown);
+            border-color: var(--gold);
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 210px minmax(0, 1fr);
+            min-height: calc(100vh - 110px);
+        }
+
+        .sidebar {
+            padding: 20px 12px;
+            background: #100e0b;
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar-heading {
+            padding: 9px;
+            margin-bottom: 8px;
+            color: var(--gold);
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            font-size: 11px;
+        }
+
+        .side-link {
+            display: block;
+            padding: 12px 10px;
+            margin-bottom: 3px;
+            color: var(--text);
+            border-left: 3px solid transparent;
+            text-decoration: none;
+        }
+
+        .side-link:hover,
+        .side-link.active {
+            background: #291c13;
+            border-left-color: var(--gold);
+            color: var(--gold-light);
+        }
+
+        .sidebar-note {
+            margin-top: auto;
+            padding: 16px 5px;
+            color: var(--muted);
+            font-size: 12px;
+            font-style: italic;
+            line-height: 1.8;
+            text-align: center;
+            border-top: 1px solid var(--border);
+        }
+
+        main {
+            min-width: 0;
+            padding: 22px;
+        }
+
+        .panel {
+            margin-bottom: 20px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+        }
+
+        .panel-heading {
+            padding: 14px 17px;
+            background: #21180f;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-heading h2 {
+            margin: 0;
+            color: var(--gold-light);
+            font-size: 22px;
+            font-weight: normal;
+            font-variant: small-caps;
+        }
+
+        .panel-body {
+            padding: 22px;
+        }
+
+        .description {
+            max-width: 680px;
+            margin: 0 0 22px;
+            color: var(--muted);
+            font-size: 15px;
+            line-height: 1.8;
+        }
+
+        .actions {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+        }
+
+        .action {
+            min-height: 150px;
+            padding: 20px;
+            background: #19130e;
+            border: 1px solid var(--border);
+        }
+
+        .action h3 {
+            margin: 0 0 10px;
+            color: var(--gold-light);
+            font-size: 18px;
+            font-weight: normal;
+        }
+
+        .action p {
+            min-height: 42px;
+            margin: 0 0 18px;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        .action button {
+            width: 100%;
+            padding: 12px 16px;
+            background: var(--brown);
+            border: 1px solid var(--gold);
+            color: var(--gold-light);
+            font: inherit;
+            cursor: not-allowed;
+            opacity: 0.65;
+        }
+
+        .action.danger button {
+            background: #321b15;
+            border-color: #764035;
+            color: #d6a08f;
+        }
+
+        .notice {
+            margin-top: 18px;
+            padding: 13px 16px;
+            background: #21180f;
+            border-left: 3px solid var(--gold);
+            color: var(--muted);
+            line-height: 1.7;
+        }
+
+        footer {
+            padding: 18px;
+            border-top: 1px solid var(--border);
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        @media (max-width: 650px) {
+            header {
+                padding: 16px;
+            }
+
+            .layout {
+                grid-template-columns: 115px minmax(0, 1fr);
+            }
+
+            .sidebar {
+                padding: 12px 6px;
+            }
+
+            main {
+                padding: 10px 6px;
+            }
+
+            .panel-body {
+                padding: 14px;
+            }
+
+            .actions {
+                grid-template-columns: 1fr;
+            }
+
+            nav a {
+                padding: 8px;
+                font-size: 12px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div class="brand">
+            <h1>Curia Regis</h1>
+            <p>Stewardship of the node and its keys.</p>
+        </div>
+
+        <nav aria-label="Main navigation">
+            <a href="/index.html">Home</a>
+            <a href="/Discussion_Hall/Discussion_Hall.html">Discussion Hall</a>
+            <a href="/Post_Office/Post_Office.html">Post Office</a>
+        </nav>
+    </header>
+
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="sidebar-heading">Your Network</div>
+            <a class="side-link" href="/index.html">Home</a>
+            <a class="side-link" href="/Discussion_Hall/Discussion_Hall.html">Discussion Hall</a>
+            <a class="side-link" href="/Post_Office/Post_Office.html">Post Office</a>
+            <a class="side-link active" href="/Kings_Court/Kings_Court.html" aria-current="page">Curia Regis</a>
+            <div class="sidebar-note">Node administration and key management.</div>
+        </aside>
+
+        <main>
+            <section class="panel">
+                <div class="panel-heading">
+                    <h2>Node Administration</h2>
+                </div>
+                <div class="panel-body">
+                    <p class="description">
+                        Administrative controls for this node. These actions are shown for reference and are not connected yet.
+                    </p>
+
+                    <div class="actions">
+                        <section class="action danger">
+                            <h3>Restart the node</h3>
+                            <p>Restart this node and reconnect it to the network.</p>
+                            <button type="button" disabled>Reset Node</button>
+                        </section>
+
+                        <section class="action">
+                            <h3>Replace the node keys</h3>
+                            <p>Generate a new RSA key pair for this node.</p>
+                            <button type="button" disabled>Regenerate Keys</button>
+                        </section>
+                    </div>
+
+                    <div class="notice" role="note">
+                        These controls are currently unavailable because node actions are not connected to this page.
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <footer>Curia Regis · Node administration</footer>
+</body>
+</html>
