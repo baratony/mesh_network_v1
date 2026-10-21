@@ -38,7 +38,10 @@ static size_t request_length;
 /* Decoded copies of the query arguments, so the handlers always receive a
  * plain, NUL-terminated C string of bounded length. */
 static char arg_first[SITE_QUERY_ARG_MAX];
-static char arg_second[SITE_QUERY_ARG_MAX];
+
+/* A POST body is not a query argument: a letter may be much longer than one,
+ * so it gets its own buffer, sized like the request itself. */
+static char arg_body[SITE_REQUEST_MAX];
 
 /* --------------------------------------------------------------------------
  * Writing the response
@@ -322,12 +325,12 @@ static void site_dispatch(void)
         site_decode_arg(query, "recipient", arg_first, sizeof(arg_first));
 
         size_t body_length = strlen(body);
-        if (body_length >= sizeof(arg_second))
-            body_length = sizeof(arg_second) - 1u;
-        memcpy(arg_second, body, body_length);
-        arg_second[body_length] = '\0';
+        if (body_length >= sizeof(arg_body))
+            body_length = sizeof(arg_body) - 1u;
+        memcpy(arg_body, body, body_length);
+        arg_body[body_length] = '\0';
 
-        site_action_post_send(arg_first, arg_second);
+        site_action_post_send(arg_first, arg_body);
     }
     else if (strcmp(action, "post_refresh") == 0)
         site_action_post_refresh();
