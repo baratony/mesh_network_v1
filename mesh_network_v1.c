@@ -18,6 +18,8 @@
 
 #include "Ethernet_FTP/ethernet_setup.h"
 #include "Ethernet_FTP/ftp_client.h"
+#include "Website/site_server.h"
+#include "Website/site_actions.h"
 #include "Radio/ebyte_e32.h"
 #include "Radio/radio.h"
 #include "Radio/radio_packet_protocol.h"
@@ -62,6 +64,16 @@ static mpz_t rsa_private_exponent;
 static mpz_t rsa_public_modulus;
 static mpz_t shared_secret;
 static bool shared_secret_valid;
+
+/* shared_secret is only meaningful together with the node it belongs to:
+ * there is exactly one exchange in flight at a time, so the peer has to be
+ * remembered next to it. A private letter can only be opened by that node. */
+static uint32_t shared_secret_peer;
+
+/* A zero bignum to hand to Respond_To_Private_Message when the letter did not
+ * come from the node this shared secret belongs to. The handler rejects a
+ * non-positive secret, so an unrelated letter is simply not opened. */
+static mpz_t shared_secret_empty;
 
 /* The W5500 is shared between the two cores: Core 0 answers HTTP requests
    while Core 1 runs FTP. Every network access must be serialised.
@@ -405,25 +417,34 @@ static void dispatch_packet(const radio_packet_t *packet)
             break;
 
         case RADIO_CMD_SEND_ENCRYPTION_REQUEST:
-            Respond_To_DH_Exchange_Request(node_global_address,
-                                           &radio,
-                                           &node_ftp,
-                                           packet,
-                                           rsa_private_exponent,
-                                           rsa_public_modulus,
-                                           shared_secret);
-            shared_secret_valid = true;
+            /* The peer of a finished exchange is the node that sent us the
+             * parameters, so it is recorded only when the handler actually
+             * derived a secret. */
+            if (Respond_To_DH_Exchange_Request(node_global_address,
+                                               &radio,
+                                               &node_ftp,
+                                               packet,
+                                               rsa_private_exponent,
+                                               rsa_public_modulus,
+                                               shared_secret))
+            {
+                shared_secret_valid = true;
+                shared_secret_peer = packet->source;
+            }
             break;
 
         case RADIO_CMD_SEND_ENCRYPTION_RESPONSE:
-            Respond_To_DH_Exchange_Response(node_global_address,
-                                           &radio,
-                                           &node_ftp,
-                                           packet,
-                                           rsa_private_exponent,
-                                           rsa_public_modulus,
-                                           shared_secret);
-            shared_secret_valid = true;
+            if (Respond_To_DH_Exchange_Response(node_global_address,
+                                                &radio,
+                                                &node_ftp,
+                                                packet,
+                                                rsa_private_exponent,
+                                                rsa_public_modulus,
+                                                shared_secret))
+            {
+                shared_secret_valid = true;
+                shared_secret_peer = packet->source;
+            }
             break;
 
         case RADIO_CMD_DH_EXCHANGE_CONFIRMED:
@@ -431,6 +452,24 @@ static void dispatch_packet(const radio_packet_t *packet)
             Respond_To_DH_Exchange_Result(node_global_address,
                                          &node_ftp,
                                          packet);
+            break;
+
+        /* --- the two message types the control panel can send ---------- */
+        case RADIO_CMD_PRIVATE_MESSAGE:
+            Respond_To_Private_Message(node_global_address,
+                                       &radio,
+                                       &node_ftp,
+                                       packet,
+                                       (packet->source == shared_secret_peer)
+                                           ? shared_secret
+                                           : shared_secret_empty);
+            break;
+
+        case RADIO_CMD_PUBLIC_MESSAGE:
+            Respond_To_Public_Message(node_global_address,
+                                      &radio,
+                                      &node_ftp,
+                                      packet);
             break;
 
         default:
@@ -603,7 +642,160 @@ static bool join_mesh_as_new_node(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 9. Core 1 - the radio
+ * 10. Control panel actions
+ *
+ * These are the buttons of the hosted site. site_server.c turns a browser
+ * request into a call to one of them, so the wiring already exists end to end:
+ * click -> HTTP request -> parse -> call here.
+ *
+ * IMPORTANT: the buttons are pressed on Core 0, but sending a message needs the
+ * radio and the FTP client, which belong to Core 1. So a button only QUEUES
+ * what was asked; Core 1 carries it out between packets, when neither the
+ * radio nor the ledger is in the middle of something else.
+ * --------------------------------------------------------------------------- */
+
+#define SITE_ACTION_TEXT_MAX     1024
+#define SITE_ACTION_NAME_MAX     100
+
+static char pending_public_text[SITE_ACTION_TEXT_MAX];
+static bool pending_public_active;
+
+static char pending_private_text[SITE_ACTION_TEXT_MAX];
+static char pending_private_recipient[SITE_ACTION_NAME_MAX];
+static bool pending_private_active;
+
+/* Discussion Hall: the visitor pressed "Send". Queue a public post. */
+void site_action_discussion_send(const char *message)
+{
+    if (message == NULL || message[0] == '\0')
+        return;
+
+    /* One post at a time: a second click before the first was carried out is
+     * dropped rather than overwriting it. */
+    if (pending_public_active)
+        return;
+
+    size_t length = strlen(message);
+    if (length >= sizeof(pending_public_text))
+        length = sizeof(pending_public_text) - 1u;
+
+    memcpy(pending_public_text, message, length);
+    pending_public_text[length] = '\0';
+    pending_public_active = true;
+}
+
+/* Post Office: the compose form was submitted. Queue a private letter. */
+void site_action_post_send(const char *recipient, const char *message)
+{
+    if (recipient == NULL || message == NULL ||
+        recipient[0] == '\0' || message[0] == '\0')
+        return;
+
+    if (pending_private_active)
+        return;
+
+    size_t length = strlen(message);
+    if (length >= sizeof(pending_private_text))
+        length = sizeof(pending_private_text) - 1u;
+
+    memcpy(pending_private_text, message, length);
+    pending_private_text[length] = '\0';
+
+    length = strlen(recipient);
+    if (length >= sizeof(pending_private_recipient))
+        length = sizeof(pending_private_recipient) - 1u;
+
+    memcpy(pending_private_recipient, recipient, length);
+    pending_private_recipient[length] = '\0';
+    pending_private_active = true;
+}
+
+/* Post Office: "Refresh". Nothing to carry out yet: the page re-reads the
+ * file itself, and the node's copy is already up to date. */
+void site_action_post_refresh(void)
+{
+}
+
+/* Post Office: the "Inbox" / "All Messages" switches. */
+void site_action_post_show_folder(const char *folder)
+{
+    (void)folder;
+}
+
+/* Post Office: "Compose" and the sidebar shortcut. */
+void site_action_compose_open(void)
+{
+}
+
+/* Post Office: the minimise button of the compose window. */
+void site_action_compose_toggle(void)
+{
+}
+
+/* Curia Regis: "Reset Node". */
+void site_action_node_reset(void)
+{
+}
+
+/* Curia Regis: "Regenerate Keys". */
+void site_action_keys_regenerate(void)
+{
+}
+
+/* Carry out whatever the buttons queued, on Core 1. Called between packets so
+ * a send never interrupts the receive loop. */
+static void service_pending_site_actions(void)
+{
+    if (pending_public_active)
+    {
+        pending_public_active = false;
+
+        network_lock_enter();
+        bool sent = Send_Public_Message(pending_public_text,
+                                       node_global_address,
+                                       &radio,
+                                       &node_ftp);
+        network_lock_exit();
+
+        if (!sent)
+            printf("[NODE] Public message did not reach the mesh\n");
+    }
+
+    if (pending_private_active)
+    {
+        /* The addressee is typed as the global address shown on the pages. */
+        unsigned long target_value = 0;
+        if (sscanf(pending_private_recipient, "%lX", &target_value) != 1)
+            target_value = 0;
+
+        uint32_t target = (uint32_t)target_value;
+
+        pending_private_active = false;
+
+        if (target == 0 || !shared_secret_valid || target != shared_secret_peer)
+        {
+            printf("[NODE] No shared secret with %08lX, letter not sent\n",
+                   (unsigned long)target);
+            return;
+        }
+
+        network_lock_enter();
+        bool sent = Send_Private_Message(node_global_address,
+                                        target,
+                                        pending_private_text,
+                                        shared_secret,
+                                        &radio,
+                                        &node_ftp);
+        network_lock_exit();
+
+        if (!sent)
+            printf("[NODE] Private letter to %08lX was not acknowledged\n",
+                   (unsigned long)target);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * 11. Core 1 - the radio
  * --------------------------------------------------------------------------- */
 
 void second_core_code(void)
@@ -661,6 +853,10 @@ void second_core_code(void)
     /* Receive, sort and dispatch. */
     while (true)
     {
+        /* Anything the control panel queued is carried out here, between
+         * packets, so a send never interrupts the receive loop. */
+        service_pending_site_actions();
+
         radio_packet_t packet;
 
         if (!radio_receive_packet(&radio, &packet))
@@ -680,7 +876,7 @@ void second_core_code(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 10. Core 0 - Ethernet and the control panel
+ * 12. Core 0 - Ethernet and the control panel
  * --------------------------------------------------------------------------- */
 
 int main(void)
@@ -689,6 +885,13 @@ int main(void)
     sleep_ms(2000);
 
     mutex_init(&network_lock);
+
+    /* A zeroed mpz_t is not an initialized one: mini-gmp needs the size and
+     * capacity fields that only mpz_init() sets, so both the real secret and
+     * the empty stand-in have to be initialized before any handler touches
+     * them. */
+    mpz_init(shared_secret);
+    mpz_init(shared_secret_empty);
 
     ethernet_w5500_config_t w5500 = {
         .spi = spi0,

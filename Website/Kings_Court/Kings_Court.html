@@ -289,25 +289,28 @@
                 </div>
                 <div class="panel-body">
                     <p class="description">
-                        Administrative controls for this node. These actions are shown for reference and are not connected yet.
+                        Administrative controls for this node. Each action asks
+                        this node to do something; what it then does is decided
+                        on the node itself.
                     </p>
 
                     <div class="actions">
                         <section class="action danger">
                             <h3>Restart the node</h3>
                             <p>Restart this node and reconnect it to the network.</p>
-                            <button type="button" disabled>Reset Node</button>
+                            <button type="button" onclick="askNode('/action/node_reset')">Reset Node</button>
                         </section>
 
                         <section class="action">
                             <h3>Replace the node keys</h3>
                             <p>Generate a new RSA key pair for this node.</p>
-                            <button type="button" disabled>Regenerate Keys</button>
+                            <button type="button" onclick="askNode('/action/keys_regenerate')">Regenerate Keys</button>
                         </section>
                     </div>
 
                     <div class="notice" role="note">
-                        These controls are currently unavailable because node actions are not connected to this page.
+                        These actions take effect on the node, not in the page:
+                        nothing here changes until the node has carried them out.
                     </div>
                 </div>
             </section>
@@ -315,5 +318,13 @@
     </div>
 
     <footer>Curia Regis · Node administration</footer>
+
+    <script>
+        /* Ask this node to do something. The path names a function in
+         * mesh_network_v1.c; see Website/site_actions.h for the list. */
+        function askNode(url) {
+            fetch(url).catch(function () {});
+        }
+    </script>
 </body>
 </html>

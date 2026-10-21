@@ -59,6 +59,8 @@ target_link_libraries(ethernet_setup
 
 add_executable(mesh_network_v1
     mesh_network_v1.c
+    Website/site_server.c
+    Website/site_assets.c
     Radio/ebyte_e32.c
     Radio/radio.c
     Radio/radio_packet_protocol.c
@@ -92,6 +94,7 @@ target_include_directories(mesh_network_v1 PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
         ${CMAKE_CURRENT_LIST_DIR}/Radio
         ${CMAKE_CURRENT_LIST_DIR}/Cryptographic_Functions
+        ${CMAKE_CURRENT_LIST_DIR}/Website
 )
 
 pico_add_extra_outputs(mesh_network_v1)

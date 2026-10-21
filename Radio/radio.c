@@ -3932,3 +3932,813 @@ cleanup:
     mpz_clear(generator);
     return success;
 }
+
+/* ==========================================================================
+ * THE TWO MESSAGE TYPES THE CONTROL PANEL CAN SEND
+ *
+ * A private letter and a public discussion post are the only two things the
+ * site can put into the mesh. They differ in exactly one respect - one is
+ * secret and goes to one node, the other is public and goes to all of them -
+ * and they share everything else: the fragmenting, the acknowledgement
+ * requirement, and the "append a line to a text file" storage idiom.
+ *
+ * Every message on the wire starts with the same 4-byte header
+ *     [total length of the reassembled payload][offset of this piece]
+ * so a receiver can tell a complete message from a partial one, and the
+ * sequence number ties all pieces of one message together.
+ * ==========================================================================*/
+
+#define RADIO_MESSAGE_FRAGMENT_HEADER_SIZE 4u
+#define RADIO_MESSAGE_FRAGMENT_DATA_SIZE \
+    (RADIO_MAX_DATA - RADIO_MESSAGE_FRAGMENT_HEADER_SIZE)
+
+/* A reassembled message is capped: it has to fit the buffers below, and a
+ * longer message is refused rather than silently truncated. */
+#define RADIO_MESSAGE_MAX 1024u
+#define RADIO_PRIVATE_NONCE_SIZE 12u
+#define RADIO_PRIVATE_TAG_SIZE   16u
+#define RADIO_PRIVATE_OVERHEAD   (RADIO_PRIVATE_NONCE_SIZE + RADIO_PRIVATE_TAG_SIZE)
+#define RADIO_PRIVATE_MESSAGE_MAX (RADIO_MESSAGE_MAX - RADIO_PRIVATE_OVERHEAD)
+
+#define RADIO_MESSAGE_RESPONSE_TIMEOUT_MS 8000
+
+/* The two text files the messages end up in. The names are the ones the
+ * hosted pages already fetch, so the site and the protocol agree. */
+#define RADIO_PRIVATE_MESSAGES_FILE "private_mesagges.txt"
+#define RADIO_DISCUSSION_FILE      "current_discussion.txt"
+
+#define RADIO_TEXT_FILE_MAX_SIZE 2048
+#define RADIO_PUBLIC_MESSAGE_CACHE_SIZE 32
+
+/* --- state ---------------------------------------------------------------
+ * One reassembly buffer per message type: a private letter and a public post
+ * can interleave on the wire, so they must not share one. Each is keyed by
+ * (source, sequence) exactly like the DH reassembly above. */
+static uint8_t radio_private_reassembly[RADIO_MESSAGE_MAX];
+static size_t radio_private_reassembly_length;
+static uint32_t radio_private_reassembly_source;
+static uint16_t radio_private_reassembly_sequence;
+static bool radio_private_reassembly_active;
+
+static uint8_t radio_public_reassembly[RADIO_MESSAGE_MAX];
+static size_t radio_public_reassembly_length;
+static uint32_t radio_public_reassembly_source;
+static uint16_t radio_public_reassembly_sequence;
+static bool radio_public_reassembly_active;
+
+/* A public post must reach every node exactly once. This ring remembers the
+ * (author, sequence) pairs already recorded here, which is the termination
+ * condition of the broadcast wave. */
+typedef struct
+{
+    uint32_t author;
+    uint16_t sequence;
+} radio_public_message_seen_t;
+
+static radio_public_message_seen_t radio_public_message_seen[RADIO_PUBLIC_MESSAGE_CACHE_SIZE];
+static size_t radio_public_message_seen_next;
+
+/* Shared scratch: the payload being sent, and the text file being edited.
+ * Never used by two operations at a time, so one buffer each is enough. */
+static uint8_t radio_message_payload[RADIO_MESSAGE_MAX];
+
+static char radio_text_file[RADIO_TEXT_FILE_MAX_SIZE + 1];
+static size_t radio_text_file_length;
+static bool radio_text_file_overflow;
+
+/* One counter for every message this node sends. A different sequence per
+ * message is what makes an acknowledgement unambiguous and what lets two
+ * messages in flight at once be told apart. */
+static uint16_t radio_message_sequence;
+
+/* The helpers below are written after the senders that use them, so they are
+ * declared here first. */
+static bool radio_append_text_line(ftp_client_t *ftp,
+                                   const char *file_name,
+                                   const char *line);
+
+static bool radio_send_fragmented_message(e32_t *device,
+                                          uint32_t source,
+                                          uint32_t destination,
+                                          const uint32_t *route,
+                                          uint8_t route_length,
+                                          uint16_t first_hop_local_address,
+                                          uint16_t command,
+                                          uint16_t sequence,
+                                          uint8_t flags,
+                                          const uint8_t *payload,
+                                          size_t payload_length);
+
+static bool radio_read_message_fragment(const radio_packet_t *packet,
+                                        uint32_t *total_length,
+                                        uint32_t *offset,
+                                        const uint8_t **piece,
+                                        uint32_t *piece_length);
+
+/* -------------------------------------------------------------------------
+ * Send a private letter.
+ *
+ * The key is derived, never transmitted: SHA-256 of the shared secret. Both
+ * ends can compute it because both completed the same Diffie-Hellman
+ * exchange, so nothing secret has to cross the wire except the ciphertext -
+ * and the tag, which is what makes a corrupted or misrouted letter detectable
+ * rather than silently readable garbage.
+ * ------------------------------------------------------------------------- */
+bool Send_Private_Message(uint32_t global_address,
+                          uint32_t target_global_address,
+                          const char *plain_text,
+                          mpz_t shared_secret,
+                          e32_t *radio,
+                          ftp_client_t *ftp)
+{
+    if (radio == NULL || ftp == NULL || plain_text == NULL ||
+        target_global_address == 0 || target_global_address == RADIO_BROADCAST_ADDRESS)
+        return false;
+
+    if (mpz_sgn(shared_secret) <= 0)
+        return false;
+
+    size_t text_length = strlen(plain_text);
+
+    /* Refuse an empty or over-long letter rather than sending something the
+     * receiving end could not reconstruct. */
+    if (text_length == 0 || text_length > RADIO_PRIVATE_MESSAGE_MAX)
+        return false;
+
+    /* Derive the AEAD key from the shared secret. */
+    uint8_t secret_bytes[RADIO_DH_FIELD_SIZE];
+    uint8_t key[32];
+    if (!radio_export_mpz_fixed(shared_secret, secret_bytes, sizeof(secret_bytes)))
+        return false;
+
+    sha256_hash(secret_bytes, sizeof(secret_bytes), key);
+
+    /* A fresh random nonce per letter. It travels in the clear with the
+     * ciphertext; what must stay secret is the key, not the nonce. */
+    uint8_t nonce[RADIO_PRIVATE_NONCE_SIZE];
+    for (size_t i = 0; i < RADIO_PRIVATE_NONCE_SIZE; i += 4u)
+    {
+        uint32_t value = get_rand_32();
+        memcpy(&nonce[i], &value, sizeof(value));
+    }
+
+    /* Encrypt into the shared payload buffer: nonce || ciphertext || tag. */
+    uint8_t *ciphertext = &radio_message_payload[RADIO_PRIVATE_NONCE_SIZE];
+    uint8_t *tag = &radio_message_payload[RADIO_PRIVATE_NONCE_SIZE + text_length];
+
+    if (chacha20poly1305_encrypt(key,
+                                 nonce,
+                                 (const uint8_t *)plain_text,
+                                 text_length,
+                                 ciphertext,
+                                 tag) != 0)
+        return false;
+
+    memcpy(radio_message_payload, nonce, RADIO_PRIVATE_NONCE_SIZE);
+
+    size_t payload_length = RADIO_PRIVATE_OVERHEAD + text_length;
+
+    /* Route to the addressee. A private letter must not be broadcast: an
+     * intermediate node cannot open it, so it only ever forwards it. */
+    uint32_t route[RADIO_MAX_ROUTE_ADDRESSES];
+    uint8_t route_length = 0;
+    if (!Find_Shortest_Global_Route(global_address,
+                                    target_global_address,
+                                    ftp,
+                                    route,
+                                    &route_length))
+        return false;
+
+    if (route_length < 2 || route[0] != global_address ||
+        route[route_length - 1u] != target_global_address)
+        return false;
+
+    /* The first hop has to be a neighbour we can actually dial. */
+    uint16_t first_hop_local_address = 0;
+    if (!radio_find_neighbor_local_address(ftp, route[1], &first_hop_local_address))
+        return false;
+
+    /* One sequence number for the whole letter: every fragment carries it, and
+     * the acknowledgement comes back with it. */
+    uint16_t sequence = ++radio_message_sequence;
+
+    if (!radio_send_fragmented_message(radio,
+                                       global_address,
+                                       target_global_address,
+                                       route,
+                                       route_length,
+                                       first_hop_local_address,
+                                       RADIO_CMD_PRIVATE_MESSAGE,
+                                       sequence,
+                                       RADIO_FLAG_ENCRYPTED,
+                                       radio_message_payload,
+                                       payload_length))
+        return false;
+
+    /* Wait for the addressee to acknowledge. Nothing is re-sent here: a
+     * letter that nobody confirmed is reported as failed, so the caller can
+     * decide whether to try again. */
+    absolute_time_t timeout = make_timeout_time_ms(RADIO_MESSAGE_RESPONSE_TIMEOUT_MS);
+
+    while (!time_reached(timeout))
+    {
+        radio_packet_t response;
+
+        if (radio_receive_packet(radio, &response) &&
+            response.command == RADIO_CMD_ACK &&
+            (response.flags & RADIO_FLAG_ACK) &&
+            response.sequence == sequence &&
+            response.source == target_global_address &&
+            response.destination == global_address)
+            return true;
+
+        sleep_ms(1);
+    }
+
+    return false;
+}
+
+/* -------------------------------------------------------------------------
+ * Answer a private letter.
+ *
+ * Two very different jobs share this handler, and the packet itself says
+ * which: if we are the addressee we open it, otherwise we are only a courier
+ * and must pass it on without trying to read it.
+ * ------------------------------------------------------------------------- */
+bool Respond_To_Private_Message(uint32_t global_address,
+                                e32_t *radio,
+                                ftp_client_t *ftp,
+                                const radio_packet_t *request,
+                                mpz_t shared_secret)
+{
+    if (radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_PRIVATE_MESSAGE ||
+        request->source == 0 ||
+        (request->flags & RADIO_FLAG_FRAGMENT) == 0)
+        return false;
+
+    /* --- we are only a courier: pass the fragment on, unread ------------
+     * The letter is not ours to open, so nothing is decoded and nothing is
+     * recorded. The fragment is forwarded byte for byte, keeping its source,
+     * destination, sequence and flags, so the addressee still sees the
+     * original author and the author can still match the acknowledgement. */
+    if (request->destination != global_address)
+    {
+        uint8_t hop = RADIO_MAX_ROUTE_ADDRESSES;
+
+        for (uint8_t i = 0; i + 1u < request->path_length; ++i)
+        {
+            if (request->path[i] == global_address)
+            {
+                hop = (uint8_t)(i + 1u);
+                break;
+            }
+        }
+
+        /* The route does not go through us: this packet took a different way
+         * and we must not put it on one of its own. */
+        if (hop == RADIO_MAX_ROUTE_ADDRESSES)
+            return false;
+
+        uint16_t next_hop_local_address = 0;
+        if (!radio_find_neighbor_local_address(ftp,
+                                               request->path[hop],
+                                               &next_hop_local_address))
+            return false;
+
+        radio_packet_t forwarded = *request;
+        return radio_send_packet(radio, &forwarded, next_hop_local_address, 0);
+    }
+
+    uint32_t total_length = 0;
+    uint32_t offset = 0;
+    const uint8_t *piece = NULL;
+    uint32_t piece_length = 0;
+
+    if (!radio_read_message_fragment(request, &total_length, &offset, &piece, &piece_length))
+        return false;
+
+    /* Start a new reassembly only at the first piece; a letter whose start
+     * we missed is dropped whole, never half-recorded. */
+    if (!radio_private_reassembly_active ||
+        radio_private_reassembly_source != request->source ||
+        radio_private_reassembly_sequence != request->sequence)
+    {
+        if (offset != 0)
+            return false;
+
+        radio_private_reassembly_source = request->source;
+        radio_private_reassembly_sequence = request->sequence;
+        radio_private_reassembly_length = 0;
+        radio_private_reassembly_active = true;
+    }
+
+    /* Pieces must arrive in order; a gap would silently corrupt the letter. */
+    if (offset != radio_private_reassembly_length)
+        return false;
+
+    if (radio_private_reassembly_length + piece_length > RADIO_MESSAGE_MAX)
+    {
+        radio_private_reassembly_active = false;
+        return false;
+    }
+
+    memcpy(&radio_private_reassembly[radio_private_reassembly_length],
+           piece,
+           piece_length);
+    radio_private_reassembly_length += piece_length;
+
+    /* Still incomplete: accepted, but nothing to record or acknowledge yet. */
+    if (radio_private_reassembly_length < total_length)
+        return true;
+
+    radio_private_reassembly_active = false;
+
+    /* --- we are the addressee: open it, record it, acknowledge it -------- */
+    if (radio_private_reassembly_length < RADIO_PRIVATE_OVERHEAD ||
+        (request->flags & RADIO_FLAG_ENCRYPTED) == 0)
+        return false;
+
+    if (mpz_sgn(shared_secret) <= 0)
+        return false;
+
+    uint8_t key[32];
+    uint8_t secret_bytes[RADIO_DH_FIELD_SIZE];
+    if (!radio_export_mpz_fixed(shared_secret, secret_bytes, sizeof(secret_bytes)))
+        return false;
+
+    sha256_hash(secret_bytes, sizeof(secret_bytes), key);
+
+    const uint8_t *nonce = radio_private_reassembly;
+    const uint8_t *ciphertext = &radio_private_reassembly[RADIO_PRIVATE_NONCE_SIZE];
+    size_t ciphertext_length = radio_private_reassembly_length - RADIO_PRIVATE_OVERHEAD;
+    const uint8_t *tag = &radio_private_reassembly[RADIO_PRIVATE_NONCE_SIZE + ciphertext_length];
+
+    static uint8_t opened[RADIO_PRIVATE_MESSAGE_MAX];
+
+    /* A wrong key, a tampered byte or a letter meant for someone else all
+     * end here: the tag will not match, and nothing is recorded. */
+    if (chacha20poly1305_decrypt(key,
+                                 nonce,
+                                 ciphertext,
+                                 ciphertext_length,
+                                 tag,
+                                 opened) != 0)
+        return false;
+
+    opened[ciphertext_length] = '\0';
+
+    char line[RADIO_MESSAGE_MAX + 32];
+    if (snprintf(line, sizeof(line), "%08lX: %s",
+                 (unsigned long)request->source, (char *)opened) >= (int)sizeof(line))
+        return false;
+
+    if (!radio_append_text_line(ftp, RADIO_PRIVATE_MESSAGES_FILE, line))
+        return false;
+
+    /* Acknowledge with the letter's own sequence number, so the author can
+     * tell this exact letter from any other it may have sent. */
+    radio_packet_t acknowledgement;
+    if (!radio_packet_create(&acknowledgement,
+                             global_address,
+                             request->source,
+                             RADIO_CMD_ACK,
+                             RADIO_FLAG_ACK,
+                             request->sequence))
+        return false;
+
+    /* Answer through the neighbour that is the author, not by broadcasting:
+     * only that one node is waiting for this acknowledgement. */
+    uint16_t back_to_author = 0xFFFF;
+    radio_neighbor_t neighbours[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbour_count = 0;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) &&
+        !neighbor_file_overflow)
+        radio_parse_neighbor_file(neighbours, &neighbour_count);
+
+    for (uint8_t i = 0; i < neighbour_count; ++i)
+    {
+        if (neighbours[i].global_address == request->source)
+        {
+            back_to_author = neighbours[i].local_address;
+            break;
+        }
+    }
+
+    return radio_send_packet(radio, &acknowledgement, back_to_author, 0);
+}
+
+/* -------------------------------------------------------------------------
+ * Post to the whole mesh.
+ *
+ * There is no broadcast that reaches further than one radio range, so "send
+ * to everyone" means "hand it to everyone you know, and let everyone do the
+ * same". The record is written here before it is sent, so the author keeps
+ * its own post without waiting for anyone else.
+ * ------------------------------------------------------------------------- */
+bool Send_Public_Message(const char *plain_text,
+                        uint32_t global_address,
+                        e32_t *radio,
+                        ftp_client_t *ftp)
+{
+    if (radio == NULL || ftp == NULL || plain_text == NULL ||
+        global_address == 0 || global_address == RADIO_BROADCAST_ADDRESS)
+        return false;
+
+    size_t text_length = strlen(plain_text);
+
+    if (text_length == 0 || text_length > RADIO_MESSAGE_MAX)
+        return false;
+
+    /* Keep our own post first, so the discussion is complete even if no
+     * neighbour ever acknowledges. */
+    char line[RADIO_MESSAGE_MAX + 32];
+    if (snprintf(line, sizeof(line), "%08lX: %s",
+                 (unsigned long)global_address, plain_text) >= (int)sizeof(line))
+        return false;
+
+    if (!radio_append_text_line(ftp, RADIO_DISCUSSION_FILE, line))
+        return false;
+
+    /* Who to hand it to. */
+    radio_neighbor_t neighbours[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbour_count = 0;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
+        neighbor_file_overflow ||
+        !radio_parse_neighbor_file(neighbours, &neighbour_count))
+        return false;
+
+    memcpy(radio_message_payload, plain_text, text_length);
+
+    uint16_t sequence = ++radio_message_sequence;
+    uint8_t handed_to = 0;
+
+    /* One two-hop route per neighbour: us, then that neighbour. The message
+     * is sent to every neighbour under the SAME sequence number, which is
+     * what lets the acknowledgements below be counted against one post. */
+    for (uint8_t i = 0; i < neighbour_count; ++i)
+    {
+        if (neighbours[i].global_address == global_address)
+            continue;
+
+        uint32_t route[2] = { global_address, neighbours[i].global_address };
+
+        if (!radio_send_fragmented_message(radio,
+                                           global_address,
+                                           neighbours[i].global_address,
+                                           route,
+                                           2,
+                                           neighbours[i].local_address,
+                                           RADIO_CMD_PUBLIC_MESSAGE,
+                                           sequence,
+                                           0,
+                                           radio_message_payload,
+                                           text_length))
+            return false;
+
+        ++handed_to;
+    }
+
+    if (handed_to == 0)
+        return true; /* we are the only node that knows about this post */
+
+    /* Count acknowledgements. Every neighbour must answer for the post to be
+     * called complete; a silent one means the data did not make the trip. */
+    uint8_t acknowledged = 0;
+    uint32_t acknowledged_from[RADIO_NEIGHBOR_COUNT_MAX] = {0};
+
+    absolute_time_t timeout = make_timeout_time_ms(RADIO_MESSAGE_RESPONSE_TIMEOUT_MS);
+
+    while (!time_reached(timeout) && acknowledged < handed_to)
+    {
+        radio_packet_t response;
+
+        if (radio_receive_packet(radio, &response) &&
+            response.command == RADIO_CMD_ACK &&
+            (response.flags & RADIO_FLAG_ACK) &&
+            response.sequence == sequence &&
+            response.destination == global_address)
+        {
+            /* Count each neighbour once, however many acknowledgements it
+             * happens to send. */
+            bool already_counted = false;
+            for (uint8_t i = 0; i < acknowledged; ++i)
+            {
+                if (acknowledged_from[i] == response.source)
+                {
+                    already_counted = true;
+                    break;
+                }
+            }
+
+            if (!already_counted && acknowledged < RADIO_NEIGHBOR_COUNT_MAX)
+            {
+                acknowledged_from[acknowledged++] = response.source;
+            }
+        }
+
+        sleep_ms(1);
+    }
+
+    return acknowledged >= handed_to;
+}
+
+/* --- storage: "append one line to a text file on the server" -------------
+ * Both message handlers need this, and it is the same three steps as every
+ * other ledger edit in this file: download, extend, upload. A missing file is
+ * not an error - it just means nothing has been recorded yet. */
+static void radio_text_file_cb(uint8_t *data, uint16_t length)
+{
+    size_t available = sizeof(radio_text_file) - radio_text_file_length - 1;
+
+    if (length > available)
+    {
+        length = (uint16_t)available;
+        radio_text_file_overflow = true;
+        return;
+    }
+
+    memcpy(&radio_text_file[radio_text_file_length], data, length);
+    radio_text_file_length += length;
+    radio_text_file[radio_text_file_length] = '\0';
+}
+
+/* line must not contain a newline: the files are line-based, and one record
+ * per line is what the hosted pages parse. */
+static bool radio_append_text_line(ftp_client_t *ftp,
+                                   const char *file_name,
+                                   const char *line)
+{
+    if (ftp == NULL || file_name == NULL || line == NULL || line[0] == '\0')
+        return false;
+
+    if (strchr(line, '\n') != NULL || strchr(line, '\r') != NULL)
+        return false;
+
+    radio_text_file_length = 0;
+    radio_text_file_overflow = false;
+    radio_text_file[0] = '\0';
+
+    /* A failed download means an empty file, which is legitimate here. */
+    (void)ftp_download(ftp, file_name, radio_text_file_cb);
+
+    if (radio_text_file_overflow)
+        return false;
+
+    size_t line_length = strlen(line);
+
+    /* Refuse rather than overflow: a half-written line in the ledger would
+     * corrupt every later read of the file. */
+    if (radio_text_file_length + line_length + 2u > sizeof(radio_text_file) - 1u)
+        return false;
+
+    if (radio_text_file_length > 0 && radio_text_file[radio_text_file_length - 1u] != '\n')
+        radio_text_file[radio_text_file_length++] = '\n';
+
+    memcpy(&radio_text_file[radio_text_file_length], line, line_length);
+    radio_text_file_length += line_length;
+    radio_text_file[radio_text_file_length++] = '\n';
+    radio_text_file[radio_text_file_length] = '\0';
+
+    return ftp_upload(ftp, file_name, (uint8_t *)radio_text_file,
+                      (uint32_t)radio_text_file_length);
+}
+
+/* --- fragmenting ---------------------------------------------------------
+ * A message is longer than one radio frame, so it is cut into pieces that
+ * carry their offset. Every piece of one message shares the same sequence
+ * number, which is what lets a receiver reject interleaved traffic.
+ * ------------------------------------------------------------------------- */
+static bool radio_send_fragmented_message(e32_t *device,
+                                          uint32_t source,
+                                          uint32_t destination,
+                                          const uint32_t *route,
+                                          uint8_t route_length,
+                                          uint16_t first_hop_local_address,
+                                          uint16_t command,
+                                          uint16_t sequence,
+                                          uint8_t flags,
+                                          const uint8_t *payload,
+                                          size_t payload_length)
+{
+    if (device == NULL || route == NULL || payload == NULL ||
+        payload_length == 0 || payload_length > RADIO_MESSAGE_MAX ||
+        route_length == 0 || route_length > RADIO_MAX_ROUTE_ADDRESSES)
+        return false;
+
+    for (size_t offset = 0; offset < payload_length;)
+    {
+        size_t remaining = payload_length - offset;
+        uint16_t piece = (uint16_t)(remaining > RADIO_MESSAGE_FRAGMENT_DATA_SIZE
+                                    ? RADIO_MESSAGE_FRAGMENT_DATA_SIZE
+                                    : remaining);
+
+        uint8_t data[RADIO_MAX_DATA];
+        radio_write_u16_be(data, (uint16_t)payload_length);
+        radio_write_u16_be(&data[2], (uint16_t)offset);
+        memcpy(&data[RADIO_MESSAGE_FRAGMENT_HEADER_SIZE],
+               &payload[offset],
+               piece);
+
+        radio_packet_t packet;
+        if (!radio_packet_create(&packet,
+                                 source,
+                                 destination,
+                                 command,
+                                 flags | RADIO_FLAG_FRAGMENT | RADIO_FLAG_ACK_REQUEST,
+                                 sequence) ||
+            !radio_packet_set_path(&packet, route, route_length) ||
+            !radio_packet_set_data(&packet,
+                                   data,
+                                   (uint16_t)(RADIO_MESSAGE_FRAGMENT_HEADER_SIZE + piece)) ||
+            !radio_send_packet(device, &packet, first_hop_local_address, 0))
+            return false;
+
+        offset += piece;
+    }
+
+    return true;
+}
+
+/* Pull one fragment out of a packet and check its header. Returns false when
+ * the fragment is unusable, so the caller can simply drop the packet. */
+static bool radio_read_message_fragment(const radio_packet_t *packet,
+                                        uint32_t *total_length,
+                                        uint32_t *offset,
+                                        const uint8_t **piece,
+                                        uint32_t *piece_length)
+{
+    if (packet == NULL || packet->length <= RADIO_MESSAGE_FRAGMENT_HEADER_SIZE)
+        return false;
+
+    *total_length = radio_read_u16_be_value(packet->data);
+    *offset = radio_read_u16_be_value(&packet->data[2]);
+
+    if (*total_length == 0 || *total_length > RADIO_MESSAGE_MAX ||
+        *offset >= *total_length)
+        return false;
+
+    *piece = &packet->data[RADIO_MESSAGE_FRAGMENT_HEADER_SIZE];
+    *piece_length = (uint32_t)(packet->length - RADIO_MESSAGE_FRAGMENT_HEADER_SIZE);
+
+    return *offset + *piece_length <= *total_length;
+}
+
+/* -------------------------------------------------------------------------
+ * Answer a public post.
+ *
+ * Every node does the same three things: record it, admit it, and pass it on.
+ * The record step is guarded by the (author, sequence) cache, which is what
+ * makes the wave cover the mesh exactly once instead of bouncing forever -
+ * the acknowledgement is sent either way, so a node that already has the post
+ * still proves to the sender that the data arrived.
+ * ------------------------------------------------------------------------- */
+bool Respond_To_Public_Message(uint32_t global_address,
+                              e32_t *radio,
+                              ftp_client_t *ftp,
+                              const radio_packet_t *request)
+{
+    if (radio == NULL || ftp == NULL || request == NULL ||
+        request->command != RADIO_CMD_PUBLIC_MESSAGE ||
+        request->source == 0 ||
+        request->destination != global_address ||
+        (request->flags & RADIO_FLAG_FRAGMENT) == 0)
+        return false;
+
+    uint32_t total_length = 0;
+    uint32_t offset = 0;
+    const uint8_t *piece = NULL;
+    uint32_t piece_length = 0;
+
+    if (!radio_read_message_fragment(request, &total_length, &offset, &piece, &piece_length))
+        return false;
+
+    if (!radio_public_reassembly_active ||
+        radio_public_reassembly_source != request->source ||
+        radio_public_reassembly_sequence != request->sequence)
+    {
+        if (offset != 0)
+            return false;
+
+        radio_public_reassembly_source = request->source;
+        radio_public_reassembly_sequence = request->sequence;
+        radio_public_reassembly_length = 0;
+        radio_public_reassembly_active = true;
+    }
+
+    if (offset != radio_public_reassembly_length)
+        return false;
+
+    if (radio_public_reassembly_length + piece_length > RADIO_MESSAGE_MAX)
+    {
+        radio_public_reassembly_active = false;
+        return false;
+    }
+
+    memcpy(&radio_public_reassembly[radio_public_reassembly_length],
+           piece,
+           piece_length);
+    radio_public_reassembly_length += piece_length;
+
+    if (radio_public_reassembly_length < total_length)
+        return true;
+
+    radio_public_reassembly_active = false;
+
+    /* Have we already recorded this exact post? */
+    bool already_recorded = false;
+
+    for (size_t i = 0; i < RADIO_PUBLIC_MESSAGE_CACHE_SIZE; ++i)
+    {
+        if (radio_public_message_seen[i].author == request->source &&
+            radio_public_message_seen[i].sequence == request->sequence)
+        {
+            already_recorded = true;
+            break;
+        }
+    }
+
+    radio_neighbor_t neighbours[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbour_count = 0;
+
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+    if (ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) &&
+        !neighbor_file_overflow)
+        radio_parse_neighbor_file(neighbours, &neighbour_count);
+
+    if (!already_recorded)
+    {
+        char line[RADIO_MESSAGE_MAX + 32];
+
+        if (snprintf(line, sizeof(line), "%08lX: %s",
+                     (unsigned long)request->source,
+                     (char *)radio_public_reassembly) >= (int)sizeof(line))
+            return false;
+
+        /* The post is only remembered once it is safely on the server: if
+         * this fails we leave the cache untouched, so a later copy gets
+         * another chance to be recorded. */
+        if (!radio_append_text_line(ftp, RADIO_DISCUSSION_FILE, line))
+            return false;
+
+        radio_public_message_seen[radio_public_message_seen_next].author = request->source;
+        radio_public_message_seen[radio_public_message_seen_next].sequence = request->sequence;
+        radio_public_message_seen_next =
+            (radio_public_message_seen_next + 1u) % RADIO_PUBLIC_MESSAGE_CACHE_SIZE;
+
+        /* Pass it on. The author is skipped: it already has the post, and
+         * sending it back would be the start of an endless loop. */
+        for (uint8_t i = 0; i < neighbour_count; ++i)
+        {
+            if (neighbours[i].global_address == global_address ||
+                neighbours[i].global_address == request->source)
+                continue;
+
+            uint32_t route[2] = { global_address, neighbours[i].global_address };
+
+            if (!radio_send_fragmented_message(radio,
+                                               request->source,
+                                               neighbours[i].global_address,
+                                               route,
+                                               2,
+                                               neighbours[i].local_address,
+                                               RADIO_CMD_PUBLIC_MESSAGE,
+                                               request->sequence,
+                                               0,
+                                               radio_public_reassembly,
+                                               radio_public_reassembly_length))
+                return false;
+        }
+    }
+
+    /* Acknowledge in every case, recorded or not: the sender only wants to
+     * know that the post reached this node. */
+    radio_packet_t acknowledgement;
+    if (!radio_packet_create(&acknowledgement,
+                             global_address,
+                             request->source,
+                             RADIO_CMD_ACK,
+                             RADIO_FLAG_ACK,
+                             request->sequence))
+        return false;
+
+    uint16_t back_to_author = 0xFFFF;
+
+    for (uint8_t i = 0; i < neighbour_count; ++i)
+    {
+        if (neighbours[i].global_address == request->source)
+        {
+            back_to_author = neighbours[i].local_address;
+            break;
+        }
+    }
+
+    return radio_send_packet(radio, &acknowledgement, back_to_author, 0);
+}

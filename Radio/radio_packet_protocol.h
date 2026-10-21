@@ -127,7 +127,17 @@ typedef enum
     RADIO_CMD_SEND_ENCRYPTION_REQUEST = 0xA5,      /* send g^a mod p */
     RADIO_CMD_SEND_ENCRYPTION_RESPONSE = 0xA6,     /* send g^b mod p + hash */
     RADIO_CMD_DH_EXCHANGE_CONFIRMED = 0xA7,        /* handshake OK */
-    RADIO_CMD_DH_EXCHANGE_FAILED = 0xA8,           /* handshake broken */
+        RADIO_CMD_DH_EXCHANGE_FAILED = 0xA8,           /* handshake broken */
+
+    /* --- the two message types the control panel can send ---------------
+     * PRIVATE_MESSAGE is addressed to one node and can only be read by the
+     * node that shares a DH secret with the author, so it travels the route
+     * and is never broadcast. PUBLIC_MESSAGE is plain text and bounces
+     * through the whole mesh so every node ends up with it in its own
+     * current_discussion.txt. Both are acknowledged by every node that
+     * receives them, which is what lets the sender detect a lost fragment. */
+    RADIO_CMD_PRIVATE_MESSAGE = 0xB1,
+    RADIO_CMD_PUBLIC_MESSAGE  = 0xB2,
 
     /* (the duplicated tail of the original enum has been folded into the
      * groups above - the numeric values are unchanged) */

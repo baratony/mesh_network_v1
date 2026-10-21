@@ -545,14 +545,27 @@ let messages = [];
 let selectedMessage = null;
 let currentFolder = "inbox";
 
+/* Ask the node to do something. Every button on this page ends up here: the
+ * path becomes a call to a C function in mesh_network_v1.c (see
+ * Website/site_actions.h). Nothing is expected back, so a failed request must
+ * not break the page. */
+function askNode(url) {
+    fetch(url).catch(function () {});
+}
+
 async function loadMessages() {
     const list = document.getElementById("emailList");
+
+    /* Tell the node we refreshed, so it can reload its own letter store. */
+    askNode("/action/post_refresh");
 
     list.innerHTML =
         '<div class="empty-inbox">Fetching the letters...</div>';
 
     try {
-        const response = await fetch("current_discussion.txt", {
+        /* The Post Office reads its own private letters, not the public
+         * discussion of the hall. */
+        const response = await fetch("private_mesagges.txt", {
             cache: "no-store"
         });
 
@@ -597,7 +610,7 @@ async function loadMessages() {
         errorMessage.className = "empty-inbox";
         errorMessage.textContent =
             "The letters could not be retrieved. " +
-            "Ensure current_discussion.txt is beside index.html. " +
+            "Ensure private_mesagges.txt is beside this page. " +
             error.message;
 
         list.appendChild(errorMessage);
@@ -715,6 +728,8 @@ function showEmptyViewer() {
 }
 
 function showFolder(folder) {
+    askNode("/action/post_folder?folder=" + encodeURIComponent(folder));
+
     currentFolder = folder;
     renderInbox();
 
@@ -724,6 +739,8 @@ function showFolder(folder) {
 }
 
 function openCompose() {
+    askNode("/action/compose_open");
+
     document.getElementById("composeWindow")
         .classList.remove("compose-collapsed");
 
@@ -731,6 +748,8 @@ function openCompose() {
 }
 
 function toggleCompose() {
+    askNode("/action/compose_toggle");
+
     document.getElementById("composeWindow")
         .classList.toggle("compose-collapsed");
 }
@@ -740,7 +759,24 @@ document.getElementById("composeForm").addEventListener(
     function(event) {
         event.preventDefault();
 
-        // Placeholder: no message is sent or saved yet.
+        const recipient = document.getElementById("recipient").value.trim();
+        const textarea = document.getElementById("composeMessage");
+        const letter = textarea.value.trim();
+
+        if (recipient === "" || letter === "") {
+            return;
+        }
+
+        /* The addressee goes in the query, the letter itself as the POST body:
+         * a letter may be far longer than a URL. site_action_post_send() gets
+         * both. */
+        fetch("/action/post_send?recipient=" + encodeURIComponent(recipient), {
+            method: "POST",
+            body: letter
+        }).catch(function () {});
+
+        document.querySelector(".compose-hint").textContent =
+            "Dispatched to the node";
     }
 );
 

@@ -31,6 +31,10 @@ void http_server_init(void);
 /** Service one pending HTTP request; call regularly from the application loop. */
 void http_server_poll(void);
 
+/* NOTE: the two functions above are implemented in Website/site_server.c, not
+ * here. ethernet_setup.c only owns the W5500 hardware; the site itself - its
+ * pages, its routing, and the buttons - lives next to the Website folder. */
+
 #ifdef __cplusplus
 }
 #endif

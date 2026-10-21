@@ -356,6 +356,13 @@
                 "you: " + message;
 
             input.value = "";
+
+            /* Hand the message to the node itself. The reply is not needed
+             * here: what happens to it is decided on the C side, in
+             * site_action_discussion_send(). The request is fire-and-forget,
+             * so a failure must not break the page. */
+            fetch("/action/discussion_send?message=" + encodeURIComponent(message))
+                .catch(function () {});
         }
 
         document.getElementById("messageForm").addEventListener(

@@ -297,6 +297,55 @@ bool Remove_Local_Address_From_Neighbors(uint32_t global_address,
 /* Step 1 of a DH exchange, run by the node that WANTS a secret with a
  * distant node: generate p and g^a mod p, sign it, and fragment it onto the
  * route. The private value is parked in dh_pending_* until the reply arrives. */
+/* -------------------------------------------------------------------------
+ * THE TWO MESSAGE TYPES THE CONTROL PANEL CAN SEND
+ * ------------------------------------------------------------------------- */
+
+/* Send a private letter to one node.
+ *
+ * The text is encrypted with ChaCha20-Poly1305 under a key that is the
+ * SHA-256 of the Diffie-Hellman shared secret, so only the node on the other
+ * end of that exchange can open it. The packet is addressed to
+ * target_global_address and follows the shortest route to it; it is never
+ * broadcast, because an intermediate node has no way to open it. The sender
+ * waits for the target to acknowledge before returning.
+ *
+ * plain_text must not be longer than RADIO_PRIVATE_MESSAGE_MAX bytes. */
+bool Send_Private_Message(uint32_t global_address,
+                          uint32_t target_global_address,
+                          const char *plain_text,
+                          mpz_t shared_secret,
+                          e32_t *radio,
+                          ftp_client_t *ftp);
+
+/* Answer a private letter: if it is for us, decrypt it with our own copy of
+ * the shared secret and append it to private_mesagges.txt; otherwise forward
+ * it to the next hop of its route. Either way it is acknowledged. */
+bool Respond_To_Private_Message(uint32_t global_address,
+                                e32_t *radio,
+                                ftp_client_t *ftp,
+                                const radio_packet_t *request,
+                                mpz_t shared_secret);
+
+/* Broadcast a public discussion message: append it to our own
+ * current_discussion.txt, hand it to every neighbour, and require every one
+ * of them to acknowledge. Each node that receives it does the same, so the
+ * message reaches the whole connected mesh exactly once. */
+bool Send_Public_Message(const char *plain_text,
+                        uint32_t global_address,
+                        e32_t *radio,
+                        ftp_client_t *ftp);
+/* Answer a public discussion message: record it once, acknowledge it, and
+ * pass it on. A message already recorded is acknowledged but not re-sent,
+ * which is what makes the wave terminate. */
+bool Respond_To_Public_Message(uint32_t global_address,
+                              e32_t *radio,
+                              ftp_client_t *ftp,
+                              const radio_packet_t *request);
+
+/* Step 1 of a DH exchange, run by the node that WANTS a secret with a
+ * distant node: generate p and g^a mod p, sign it, and fragment it onto the
+ * route. The private value is parked in dh_pending_* until the reply arrives. */
 bool Create_DH_Exchange_Packet(uint32_t target_global_address,
                                uint32_t personal_global_address,
                                const uint32_t *route,
