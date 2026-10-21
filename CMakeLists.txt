@@ -86,6 +86,7 @@ target_link_libraries(mesh_network_v1
     hardware_gpio
     hardware_rtc
     hardware_uart
+    pico_multicore
     pico_mbedtls
     pico_rand)
 
@@ -98,4 +99,3 @@ target_include_directories(mesh_network_v1 PRIVATE
 )
 
 pico_add_extra_outputs(mesh_network_v1)
-

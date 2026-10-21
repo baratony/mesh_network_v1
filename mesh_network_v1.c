@@ -78,10 +78,10 @@ static mpz_t shared_secret_empty;
 /* The W5500 is shared between the two cores: Core 0 answers HTTP requests
    while Core 1 runs FTP. Every network access must be serialised.
    NOTE: the FTP calls inside radio.c must use the same lock. */
-static lock_t network_lock;
+static mutex_t network_lock;
 
-static void network_lock_enter(void) { lock_enter(&network_lock); }
-static void network_lock_exit(void)  { lock_exit(&network_lock); }
+static void network_lock_enter(void) { mutex_enter_blocking(&network_lock); }
+static void network_lock_exit(void)  { mutex_exit(&network_lock); }
 
 /* ---------------------------------------------------------------------------
  * 3. Small helpers
@@ -1417,10 +1417,10 @@ int main(void)
     now.year = NODE_CREATION_YEAR;
     now.month = NODE_CREATION_MONTH;
     now.day = NODE_CREATION_DAY;
-    now.hours = 0;
-    now.minutes = 0;
-    now.seconds = 0;
-    now.weekday = 0;
+    now.hour = 0;
+    now.min = 0;
+    now.sec = 0;
+    now.dotw = 0;
     rtc_set_datetime(&now);
 
     /* Faster random clock used to seed the RSA/DH number generator. */
