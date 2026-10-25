@@ -20,6 +20,7 @@
 #include "Ethernet_FTP/ftp_client.h"
 #include "Website/site_server.h"
 #include "Website/site_actions.h"
+#include "Website/site_stats.h"
 #include "Radio/ebyte_e32.h"
 #include "Radio/radio.h"
 #include "Radio/radio_packet_protocol.h"
@@ -50,6 +51,39 @@
 /* File that keeps this node's own RSA key pair. */
 #define NODE_KEY_FILE       "node_rsa_key.txt"
 #define NODE_KEY_FILE_MAX   1024
+
+/* ---------------------------------------------------------------------------
+ * 1b. The numbers the home page shows
+ *
+ * The ledger names are repeated here rather than shared, exactly like the
+ * ones radio.c appends to: the pages and the protocol have to agree on them
+ * byte for byte, and a name that only exists on one side is the bug people
+ * keep hitting here. */
+#define SITE_LOCAL_NEIGHBORS_FILE    "local_neighbors.txt"
+#define SITE_GLOBAL_CONNECTIONS_FILE "global_connections.bin"
+
+/* One row of the global connection graph: the node itself plus up to eight
+ * neighbours, all 32-bit global addresses. */
+#define SITE_GLOBAL_CONNECTIONS_ROW_SIZE (9u * sizeof(uint32_t))
+
+/* The same cap radio.c puts on global_connections.bin, so a node can never
+ * ask for a graph this core could not hold. */
+#define SITE_GLOBAL_CONNECTIONS_MAX 4096u
+
+/* radio.c caps every text ledger at this many bytes, so "space left" is
+ * measured against the same number the writer uses. */
+#define SITE_LEDGER_LIMIT 2048u
+
+/* The two hardware numbers of this node. Nothing on the network can be
+ * measured into them: they describe this build, so they are stated once here
+ * and the home page reads them. Change them with the hardware. */
+#define SITE_NODE_PROCESSOR_MHZ 133u
+#define SITE_NODE_DATA_RATE_KBS "4.5"
+
+/* How often Core 1 re-reads the ledgers into the snapshot the pages are
+ * served from. A refresh is only ever done while the radio has nothing to
+ * hand over, so this is a cost on the node, not a delay for a browser. */
+#define SITE_SNAPSHOT_REFRESH_MS 20000u
 
 /* ---------------------------------------------------------------------------
  * 2. Shared node state
@@ -983,18 +1017,25 @@ static void ledger_text_cb(uint8_t *data, uint16_t length)
     ledger_text[ledger_text_length] = '\0';
 }
 
+/* Read one ledger file into ledger_text. The caller must already hold the
+ * network lock: this is the one FTP call every caller below shares. */
+static bool node_read_ledger_file(const char *file_name)
+{
+    ledger_text_length = 0;
+    ledger_text_overflow = false;
+    ledger_text[0] = '\0';
+
+    return ftp_download(&node_ftp, file_name, ledger_text_cb) &&
+           !ledger_text_overflow;
+}
+
 static bool node_show_ledger_file(const char *file_name)
 {
     bool ok = false;
 
     network_lock_enter();
 
-    ledger_text_length = 0;
-    ledger_text_overflow = false;
-    ledger_text[0] = '\0';
-
-    if (ftp_download(&node_ftp, file_name, ledger_text_cb) &&
-        !ledger_text_overflow)
+    if (node_read_ledger_file(file_name))
     {
         printf("[SITE] %s holds %u bytes:\n%.*s\n",
                file_name,
@@ -1010,6 +1051,120 @@ static bool node_show_ledger_file(const char *file_name)
 
     network_lock_exit();
     return ok;
+}
+
+/* --- the numbers the home page asks for ---------------------------------
+ * How many nodes the global connection graph knows about. Its rows are
+ * fixed-size and every node owns exactly one row, so the row count is the
+ * size of the mesh as this node can see it. */
+static uint8_t graph_file[SITE_GLOBAL_CONNECTIONS_MAX];
+static size_t graph_file_length;
+static bool graph_file_overflow;
+
+static void graph_file_cb(uint8_t *data, uint16_t length)
+{
+    size_t available = sizeof(graph_file) - graph_file_length;
+
+    if (length > available)
+    {
+        length = (uint16_t)available;
+        graph_file_overflow = true;
+    }
+
+    memcpy(&graph_file[graph_file_length], data, length);
+    graph_file_length += length;
+}
+
+static uint16_t site_count_graph_nodes(void)
+{
+    graph_file_length = 0;
+    graph_file_overflow = false;
+
+    if (!ftp_download(&node_ftp, SITE_GLOBAL_CONNECTIONS_FILE, graph_file_cb) ||
+        graph_file_overflow)
+        return 0u;
+
+    uint16_t rows = 0u;
+
+    for (size_t offset = 0; offset + 3u < graph_file_length;
+         offset += SITE_GLOBAL_CONNECTIONS_ROW_SIZE)
+    {
+        /* A row of four zero words is padding, not a node. */
+        if (graph_file[offset] != 0u || graph_file[offset + 1u] != 0u ||
+            graph_file[offset + 2u] != 0u || graph_file[offset + 3u] != 0u)
+            ++rows;
+    }
+
+    return rows;
+}
+
+/* Lines of a text ledger. The ledgers are one record per line, so this is
+ * the same count the Post Office page draws its list from. */
+static uint16_t site_count_text_lines(const char *text, size_t length)
+{
+    uint16_t lines = 0u;
+
+    for (size_t i = 0; i < length; ++i)
+    {
+        if (text[i] == '\n')
+            ++lines;
+    }
+
+    /* A file whose last line has no newline still has that line. */
+    if (length > 0u && text[length - 1u] != '\n')
+        ++lines;
+
+    return lines;
+}
+
+/* The neighbour list in the two forms the home page needs: the file's own
+ * text, so /local_neighbors.txt can be offered as it is stored, and the list
+ * the panel draws. Rebuilt from the parsed rows rather than downloaded again,
+ * so one FTP round trip answers both. */
+static char neighbors_text[SITE_STATS_TEXT_MAX];
+static char neighbors_html[SITE_STATS_TEXT_MAX];
+
+static void site_publish_neighbors(void)
+{
+    radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
+    uint8_t neighbor_count = 0;
+
+    size_t text_length = 0u;
+    size_t html_length = 0u;
+
+    if (radio_download_neighbor_file(&node_ftp))
+        radio_parse_neighbor_file(neighbors, &neighbor_count);
+
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        int added = snprintf(neighbors_text + text_length,
+                             sizeof(neighbors_text) - text_length,
+                             "%08lX,%u\n",
+                             (unsigned long)neighbors[i].global_address,
+                             (unsigned int)neighbors[i].local_address);
+
+        if (added < 0 || (size_t)added >= sizeof(neighbors_text) - text_length)
+            break;
+
+        text_length += (size_t)added;
+
+        added = snprintf(neighbors_html + html_length,
+                         sizeof(neighbors_html) - html_length,
+                         "<li>%08lX (radio %u)</li>",
+                         (unsigned long)neighbors[i].global_address,
+                         (unsigned int)neighbors[i].local_address);
+
+        if (added < 0 || (size_t)added >= sizeof(neighbors_html) - html_length)
+            break;
+
+        html_length += (size_t)added;
+    }
+
+    neighbors_text[text_length] = '\0';
+    neighbors_html[html_length] = '\0';
+
+    site_stats_set_text(SITE_LOCAL_NEIGHBORS_FILE, neighbors_text, text_length);
+    site_stats_set_text("neighbors", neighbors_html, html_length);
 }
 
 /* Route to a node and start a Diffie-Hellman exchange along that route.
@@ -1262,38 +1417,101 @@ static void run_node_reset(void)
            (unsigned)node_local_address);
 }
 
+/* --------------------------------------------------------------------------
+ * The snapshot the pages are served from
+ *
+ * Everything the home panel shows is a fact about this node, and every one
+ * of those facts is read from the ledger files. This is the only place that
+ * reads them all, and it runs on Core 1: Core 0 answers browsers and must
+ * never start a transfer of its own. The caller holds the network lock.
+ * -------------------------------------------------------------------------- */
+static void site_publish_snapshot(void)
+{
+    char value[SITE_STATS_VALUE_MAX];
+
+    /* This node's own identity and key. */
+    snprintf(value, sizeof(value), "%08lX", (unsigned long)node_global_address);
+    site_stats_set("node_address", value);
+
+    snprintf(value, sizeof(value), "%u",
+             (unsigned)mpz_sizeinbase(rsa_public_modulus, 2));
+    site_stats_set("rsa_bits", value);
+
+    /* The two hardware numbers of this node. */
+    snprintf(value, sizeof(value), "%u", SITE_NODE_PROCESSOR_MHZ);
+    site_stats_set("processor_mhz", value);
+
+    site_stats_set("data_rate", SITE_NODE_DATA_RATE_KBS);
+
+    site_publish_neighbors();
+
+    /* The two ledgers the pages show, and what is in them. */
+    size_t discussion_length = 0u;
+    if (node_read_ledger_file(LEDGER_DISCUSSION_FILE))
+        discussion_length = ledger_text_length;
+    site_stats_set_text(LEDGER_DISCUSSION_FILE, ledger_text, discussion_length);
+
+    size_t letters_length = 0u;
+    if (node_read_ledger_file(LEDGER_PRIVATE_MESSAGES_FILE))
+        letters_length = ledger_text_length;
+    site_stats_set_text(LEDGER_PRIVATE_MESSAGES_FILE, ledger_text, letters_length);
+
+    snprintf(value, sizeof(value), "%u",
+             (unsigned)site_count_text_lines(ledger_text, letters_length));
+    site_stats_set("letters_received", value);
+
+    /* The size of the mesh as this node can see it. */
+    snprintf(value, sizeof(value), "%u", (unsigned)site_count_graph_nodes());
+    site_stats_set("reachable_nodes", value);
+
+    /* How much more the node can still record. The ledgers are the node's
+     * only storage, and radio.c refuses to write past SITE_LEDGER_LIMIT. */
+    size_t used = (discussion_length > letters_length) ? discussion_length : letters_length;
+    size_t left = (used < SITE_LEDGER_LIMIT) ? (SITE_LEDGER_LIMIT - used) : 0u;
+
+    snprintf(value, sizeof(value), "%u", (unsigned)left);
+    site_stats_set("ledger_space", value);
+}
+
 /* Carry out whatever the buttons queued, on Core 1. Called between packets so
  * a send never interrupts the receive loop. */
 static void service_pending_site_actions(void)
 {
+    bool did_anything = false;
+
     if (pending_public_active)
     {
         pending_public_active = false;
         run_public_message();
+        did_anything = true;
     }
 
     if (pending_private_active)
     {
         pending_private_active = false;
         run_private_letter();
+        did_anything = true;
     }
 
     if (pending_refresh_active)
     {
         pending_refresh_active = false;
         node_show_ledger_file(LEDGER_PRIVATE_MESSAGES_FILE);
+        did_anything = true;
     }
 
     if (pending_folder_active)
     {
         pending_folder_active = false;
         run_folder_show();
+        did_anything = true;
     }
 
     if (pending_keys_active)
     {
         pending_keys_active = false;
         run_keys_regenerate();
+        did_anything = true;
     }
 
     /* Last: this is the longest operation and it blocks the receive loop for
@@ -1302,8 +1520,25 @@ static void service_pending_site_actions(void)
     {
         pending_reset_active = false;
         run_node_reset();
+        did_anything = true;
+    }
+
+    /* A button that touched the mesh changed what the pages should show, so
+     * re-read the ledgers straight away: the next click on the page then
+     * shows the new record rather than the one from before it. */
+    if (did_anything)
+    {
+        network_lock_enter();
+        site_publish_snapshot();
+        network_lock_exit();
     }
 }
+
+/* When the next snapshot is due. Only Core 1 reads or writes these, and only
+ * from the one place in its receive loop, so nothing else has to agree with
+ * them. */
+static bool site_snapshot_due_valid = false;
+static absolute_time_t site_snapshot_due;
 
 /* ---------------------------------------------------------------------------
  * 11. Core 1 - the radio
@@ -1370,6 +1605,13 @@ void second_core_code(void)
                (unsigned int)node_local_address);
     }
 
+    /* The pages need something to show before the first browser arrives, so
+     * the snapshot is taken once here, right after the node is known to the
+     * mesh. */
+    network_lock_enter();
+    site_publish_snapshot();
+    network_lock_exit();
+
     /* Receive, sort and dispatch. */
     while (true)
     {
@@ -1382,6 +1624,21 @@ void second_core_code(void)
         if (!radio_receive_packet(&radio, &packet))
         {
             sleep_ms(1);
+
+            /* The radio has nothing to hand over, so this is a safe point
+             * for one more read of the ledgers. Doing it here rather than
+             * at the top of the loop is what keeps a refresh from swallowing
+             * a packet that is on its way in. */
+            if (!site_snapshot_due_valid || time_reached(site_snapshot_due))
+            {
+                site_snapshot_due = make_timeout_time_ms(SITE_SNAPSHOT_REFRESH_MS);
+                site_snapshot_due_valid = true;
+
+                network_lock_enter();
+                site_publish_snapshot();
+                network_lock_exit();
+            }
+
             continue;
         }
 

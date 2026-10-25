@@ -10,6 +10,7 @@
 #include "site_server.h"
 #include "site_assets.h"
 #include "site_actions.h"
+#include "site_stats.h"
 
 #include "socket.h"
 #include "wizchip_conf.h"
@@ -27,6 +28,15 @@
 #define SITE_REQUEST_MAX          1600
 #define SITE_SEND_CHUNK           512
 #define SITE_QUERY_ARG_MAX        256
+
+/* A template page writes {{ name }} where a number belongs. The name inside
+ * is at most this long; anything longer is not a name this node knows. */
+#define SITE_MARKER_NAME_MAX      32
+
+/* The node's own ledger files, by the name radio.c writes them under. */
+#define SITE_DISCUSSION_FILE        "current_discussion.txt"
+#define SITE_PRIVATE_MESSAGES_FILE  "private_mesagges.txt"
+#define SITE_LOCAL_NEIGHBORS_FILE   "local_neighbors.txt"
 
 /* --------------------------------------------------------------------------
  * Request state
@@ -152,6 +162,81 @@ static void site_send_asset(const site_asset_t *asset)
 }
 
 /* --------------------------------------------------------------------------
+ * The live part of the page
+ *
+ * Two kinds of document are not the compiled-in bytes:
+ *
+ *   - the node's own ledger files. The pages fetch them by name so the
+ *     browser sees what is ACTUALLY stored, which is the only way a message
+ *     the node has just recorded can appear on a page. They are served from
+ *     the snapshot Core 1 keeps in RAM (see site_stats.h): this core must
+ *     never start an FTP transfer of its own, because the W5500 is already
+ *     busy answering the browser.
+ *
+ *   - the home page. It is a template: the compiled-in bytes carry
+ *     {{markers}} where a number belongs, filled in while it is sent.
+ * -------------------------------------------------------------------------- */
+
+/* The URL a page asks for -> the file it is the live copy of. */
+static const struct
+{
+    const char *url;
+    const char *file_name;
+} site_ledger_pages[] = {
+    { "/Discussion_Hall/current_discussion.txt", SITE_DISCUSSION_FILE },
+    { "/Post_Office/private_mesagges.txt",       SITE_PRIVATE_MESSAGES_FILE },
+    { "/local_neighbors.txt",                    SITE_LOCAL_NEIGHBORS_FILE },
+};
+
+#define SITE_LEDGER_PAGE_COUNT \
+    (sizeof(site_ledger_pages) / sizeof(site_ledger_pages[0]))
+
+/* The pages that are templates rather than fixed text. */
+static const char *const site_template_paths[] = { "/", "/index.html" };
+
+#define SITE_TEMPLATE_COUNT \
+    (sizeof(site_template_paths) / sizeof(site_template_paths[0]))
+
+static int site_is_template(const char *path)
+{
+    for (size_t i = 0; i < SITE_TEMPLATE_COUNT; ++i)
+    {
+        if (strcmp(site_template_paths[i], path) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Plain text with an exact length: what the live ledger files need, and what
+ * an empty one needs too, so the page shows an empty record rather than an
+ * error. */
+static void site_send_plain(const char *body, size_t length)
+{
+    char header[256];
+
+    int length_written = snprintf(header, sizeof(header),
+                                  "HTTP/1.1 200 OK\r\n"
+                                  "Content-Type: text/plain; charset=utf-8\r\n"
+                                  "Content-Length: %u\r\n"
+                                  "Connection: close\r\n"
+                                  "\r\n",
+                                  (unsigned)length);
+
+    if (length_written < 0)
+        return;
+
+    if ((size_t)length_written >= sizeof(header))
+        length_written = (int)sizeof(header) - 1;
+
+    if (site_send_all(header, (size_t)length_written) < 0)
+        return;
+
+    if (length > 0)
+        site_send_all(body, length);
+}
+
+/* --------------------------------------------------------------------------
  * Reading the request
  *
  * The buffer is complete once the blank line that ends the headers has been
@@ -240,6 +325,150 @@ static int site_decode_arg(const char *query,
 }
 
 /* --------------------------------------------------------------------------
+ * Rendering a template
+ *
+ * A rendered page cannot promise a Content-Length: the substitutions are not
+ * known until they are made, and making them twice could make them twice
+ * differently. Chunked encoding needs no length up front, so the page is
+ * emitted in one pass and the browser is told where each piece ends.
+ * -------------------------------------------------------------------------- */
+
+/* One chunk of a chunked body: the byte count, the bytes, a blank line. */
+static int site_send_chunk(const char *data, size_t length)
+{
+    if (length == 0)
+        return 0;
+
+    char head[16];
+
+    int head_length = snprintf(head, sizeof(head), "%X\r\n", (unsigned)length);
+    if (head_length < 0 || (size_t)head_length >= sizeof(head))
+        return -1;
+
+    if (site_send_all(head, (size_t)head_length) < 0)
+        return -1;
+
+    if (site_send_all(data, length) < 0)
+        return -1;
+
+    return site_send_all("\r\n", 2u);
+}
+
+/* Recognise "{{ name }}" at the start of text.
+ * Returns 0 when there is no marker there, and the caller must treat text[0]
+ * as one literal byte. Returns 1 when there is one: *marker_length is the
+ * number of template bytes it takes over, and *value / *value_length are the
+ * bytes to put in its place, which is empty when nothing on the node has a
+ * value for that name. */
+static int site_marker_lookup(const char *text, size_t length,
+                              const char **value, size_t *value_length,
+                              size_t *marker_length)
+{
+    if (length < 4u || text[0] != '{' || text[1] != '{')
+        return 0;
+
+    size_t at = 2u;
+    while (at + 1u < length && !(text[at] == '}' && text[at + 1u] == '}'))
+        ++at;
+
+    /* An unclosed brace is just a page that happens to contain one. */
+    if (at + 1u >= length)
+        return 0;
+
+    size_t from = 2u;
+    size_t to = at;
+
+    while (from < to && (text[from] == ' ' || text[from] == '\t'))
+        ++from;
+    while (to > from && (text[to - 1u] == ' ' || text[to - 1u] == '\t'))
+        --to;
+
+    if (to - from >= SITE_MARKER_NAME_MAX)
+        return 0;
+
+    char name[SITE_MARKER_NAME_MAX];
+    memcpy(name, text + from, to - from);
+    name[to - from] = '\0';
+
+    *marker_length = at + 2u;
+
+    size_t found_length = 0;
+    const uint8_t *found = site_stats_get(name, &found_length);
+
+    *value = (found != NULL) ? (const char *)found : "";
+    *value_length = (found != NULL) ? found_length : 0u;
+
+    return 1;
+}
+
+/* Send a template with every marker replaced. Literal runs are sent as they
+ * come; nothing is buffered, so a 15 kB page still costs no RAM. */
+static int site_render_body(const char *text, size_t length)
+{
+    size_t at = 0;
+
+    while (at < length)
+    {
+        const char *value = NULL;
+        size_t value_length = 0;
+        size_t marker_length = 0;
+
+        if (site_marker_lookup(text + at, length - at, &value, &value_length, &marker_length))
+        {
+            if (value_length > 0u && site_send_chunk(value, value_length) < 0)
+                return -1;
+
+            at += marker_length;
+            continue;
+        }
+
+        /* Not a marker: take this byte, and every one after it that is not
+         * the start of a marker either. */
+        size_t run = 1u;
+        while (at + run < length &&
+               !site_marker_lookup(text + at + run, length - at - run, &value, &value_length, &marker_length))
+            ++run;
+
+        if (site_send_chunk(text + at, run) < 0)
+            return -1;
+
+        at += run;
+    }
+
+    return 0;
+}
+
+static void site_send_rendered(const site_asset_t *asset)
+{
+    char header[256];
+
+    int length_written = snprintf(header, sizeof(header),
+                                  "HTTP/1.1 200 OK\r\n"
+                                  "Content-Type: %s\r\n"
+                                  "Transfer-Encoding: chunked\r\n"
+                                  "Connection: close\r\n"
+                                  "\r\n",
+                                  asset->content_type);
+
+    if (length_written < 0)
+        return;
+
+    if ((size_t)length_written >= sizeof(header))
+        length_written = (int)sizeof(header) - 1;
+
+    if (site_send_all(header, (size_t)length_written) < 0)
+    {
+        printf("[HTTP] header send failed for %s\n", asset->name);
+        return;
+    }
+
+    if (site_render_body(asset->body, asset->length) < 0)
+        printf("[HTTP] body send failed for %s\n", asset->name);
+    else
+        site_send_all("0\r\n\r\n", 5u);
+}
+
+/* --------------------------------------------------------------------------
  * The request line
  *
  * A browser sends "GET /path HTTP/1.1", but the W5500's LISTEN mode can hand
@@ -274,7 +503,16 @@ static void site_dispatch(void)
     /* A bare "/" or an empty path is the home page. */
     if (path[0] == '\0' || strcmp(path, "/") == 0)
     {
-        site_send_asset(site_find_asset("/"));
+        const site_asset_t *home = site_find_asset("/");
+
+        if (home != NULL)
+        {
+            if (site_is_template("/"))
+                site_send_rendered(home);
+            else
+                site_send_asset(home);
+        }
+
         return;
     }
 
@@ -290,11 +528,44 @@ static void site_dispatch(void)
     else
         query = (char *)site_no_query;
 
+    /* --- 0. the node's own ledger files, from the live snapshot -----
+     * They are checked before the compiled-in table so a page can never be
+     * shown from the copy that was baked in at build time once the node has
+     * read the real one. */
+    for (size_t i = 0; i < SITE_LEDGER_PAGE_COUNT; ++i)
+    {
+        if (strcmp(site_ledger_pages[i].url, path) != 0)
+            continue;
+
+        size_t body_length = 0;
+        const uint8_t *body = site_stats_get(site_ledger_pages[i].file_name, &body_length);
+
+        if (body != NULL)
+            site_send_plain((const char *)body, body_length);
+        else
+        {
+            /* Nothing has been read yet. Fall back to the compiled-in copy
+             * so the page still renders, and an empty record when there is
+             * not even one of that. */
+            const site_asset_t *fallback = site_find_asset(path);
+            if (fallback != NULL)
+                site_send_asset(fallback);
+            else
+                site_send_plain("", 0u);
+        }
+
+        return;
+    }
+
     /* --- 1. a real file wins first -------------------------------------- */
     const site_asset_t *asset = site_find_asset(path);
     if (asset != NULL)
     {
-        site_send_asset(asset);
+        if (site_is_template(path))
+            site_send_rendered(asset);
+        else
+            site_send_asset(asset);
+
         return;
     }
 

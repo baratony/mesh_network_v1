@@ -295,8 +295,8 @@
                     <h2>Welcome Back</h2>
                 </div>
                 <div class="panel-body welcome">
-                    <p>Welcome back to Domostroi, <strong>User //place holder//</strong>.</p>
-                    <p><strong>//place holder//</strong> letters were sent to you in the last 48 hours.</p>
+                    <p>Welcome back to Domostroi, <strong>node {{node_address}}</strong>.</p>
+                    <p><strong>{{letters_received}}</strong> letters are recorded in your Post Office.</p>
                     <div class="actions">
                         <a class="action-link" href="/Discussion_Hall/Discussion_Hall.html">Enter Discussion Hall</a>
                         <a class="action-link" href="/Post_Office/Post_Office.html">Enter Post Office</a>
@@ -310,16 +310,7 @@
                         <h2>Local Neighbors</h2>
                     </div>
                     <div class="panel-body">
-                        <ul class="neighbor-list">
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                            <li>//Place Holder//</li>
-                        </ul>
+                        <ul class="neighbor-list">{{neighbors}}</ul>
                     </div>
                 </section>
 
@@ -328,7 +319,7 @@
                         <h2>Total Reachable Nodes</h2>
                     </div>
                     <div class="panel-body">
-                        <p class="stat-value">//Place Holder//</p>
+                        <p class="stat-value">{{reachable_nodes}}</p>
                     </div>
                 </section>
             </div>
@@ -340,20 +331,20 @@
                 <div class="panel-body">
                     <dl class="stats-list">
                         <div>
-                            <dt>Storage Left</dt>
-                            <dd>//Place Holder// GB</dd>
+                            <dt>Ledger Space Left</dt>
+                            <dd>{{ledger_space}} Bytes</dd>
                         </div>
                         <div>
                             <dt>Processor Speed</dt>
-                            <dd>//Place Holder// MHz</dd>
+                            <dd>{{processor_mhz}} MHz</dd>
                         </div>
                         <div>
                             <dt>Current Data Rate</dt>
-                            <dd>//Place Holder// KBS</dd>
+                            <dd>{{data_rate}} KBS</dd>
                         </div>
                         <div>
                             <dt>RSA Key Length</dt>
-                            <dd>//Place Holder// Bits</dd>
+                            <dd>{{rsa_bits}} Bits</dd>
                         </div>
                     </dl>
                 </div>

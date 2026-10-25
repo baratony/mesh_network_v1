@@ -61,6 +61,7 @@ add_executable(mesh_network_v1
     mesh_network_v1.c
     Website/site_server.c
     Website/site_assets.c
+    Website/site_stats.c
     Radio/ebyte_e32.c
     Radio/radio.c
     Radio/radio_packet_protocol.c
