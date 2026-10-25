@@ -31,8 +31,8 @@
 
 /* E32 module: UART data lines + M0/M1 control lines. */
 #define RADIO_UART        uart1
-#define RADIO_TX_PIN      4
-#define RADIO_RX_PIN      5
+#define RADIO_TX_PIN      0
+#define RADIO_RX_PIN      1
 #define RADIO_M0_PIN      6
 #define RADIO_M1_PIN      7
 #define RADIO_CHANNEL     0
@@ -55,7 +55,14 @@
  * 2. Shared node state
  * --------------------------------------------------------------------------- */
 
-static ftp_client_t node_ftp;
+/* Replace these placeholders with the FTP server's connection details. */
+static ftp_client_t node_ftp = {
+    .server_ip = "//FTP SERVER IP ADDRESS//",
+    .port = 21,
+    .username = "//PLACE HOLDER NAME//",
+    .password = "//PLACE HOLDER PASSWORD//",
+    .debug = 1,
+};
 
 static uint32_t node_global_address;
 static uint16_t node_local_address;
@@ -1316,9 +1323,16 @@ void second_core_code(void)
     /* The FTP client runs on this core. */
     network_lock_enter();
 
-    if (!ftp_connect(&node_ftp) || !ftp_login(&node_ftp))
+    if (!ftp_connect(&node_ftp))
     {
-        printf("[CORE1] FTP connection failed, the node cannot join the mesh\n");
+        printf("[CORE1] FTP connection failed due to invalid IP address or other network credetials, the node cannot join the mesh\n");
+        network_lock_exit();
+        return;
+    }
+
+    if (!ftp_login(&node_ftp))
+    {
+        printf("[CORE1] FTP connection failed due to incorrect login username or password, the node cannot join the mesh\n");
         network_lock_exit();
         return;
     }
@@ -1336,6 +1350,7 @@ void second_core_code(void)
 
     if (new_node)
     {
+        printf("[CORE 1] New Node Detected! Starting intilization process.");
         if (!join_mesh_as_new_node())
             return;
     }
@@ -1343,6 +1358,7 @@ void second_core_code(void)
     {
         /* We already belong to the mesh: read the neighbour list again and
            re-claim a local address. */
+        printf("[CORE 1] Previous node registered, enetering normal operartion.");
         network_lock_enter();
 
         node_local_address = Generate_Local_Adress(node_global_address, &radio, &node_ftp);
@@ -1370,6 +1386,7 @@ void second_core_code(void)
         }
 
         if (!packet_is_for_us(&packet))
+            printf("[CORE 1] Packet Recieved.");
             continue;
 
         if (packet_already_seen(&packet))
@@ -1386,7 +1403,8 @@ void second_core_code(void)
 int main(void)
 {
     stdio_init_all();
-    sleep_ms(2000);
+    sleep_ms(8000);
+    printf("Booting....");
 
     mutex_init(&network_lock);
 
