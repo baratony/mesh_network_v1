@@ -91,10 +91,10 @@
 
 /* Replace these placeholders with the FTP server's connection details. */
 static ftp_client_t node_ftp = {
-    .server_ip = "//FTP SERVER IP ADDRESS//",
+    .server_ip = "//PLACE HOLDER//",
     .port = 21,
-    .username = "//PLACE HOLDER NAME//",
-    .password = "//PLACE HOLDER PASSWORD//",
+    .username = "//PLACE HOLDER//",
+    .password = "//PLACE HOLDER//",
     .debug = 1,
 };
 
