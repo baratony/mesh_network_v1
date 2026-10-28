@@ -3,9 +3,8 @@
  *
  * It owns the third W5500 socket (0 and 1 belong to the FTP client that Core
  * 1 uses for the mesh ledger). Because the two cores share one W5500, main()
- * keeps this server outside the network_lock that guards FTP: the W5500 can
- * only do one thing at a time, and a browser request must never be blocked by
- * a file transfer.
+ * holds the shared network lock while initializing or polling this server;
+ * those operations must not overlap FTP transfers.
  * ==========================================================================*/
 #include "site_server.h"
 #include "site_assets.h"

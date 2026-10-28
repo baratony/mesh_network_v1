@@ -228,13 +228,11 @@ bool RSA_key_generation(mpz_t p, mpz_t q, mpz_t Public_Modulo, mpz_t Private_Key
     mpz_t qd;
     mpz_t pd;
     mpz_t phi;
-    mpz_t d;
     mpz_t e;
 
     mpz_init(qd);
     mpz_init(pd);
     mpz_init(phi);
-    mpz_init(d);
     mpz_init(e);
 
     // Set e = 65537
@@ -250,17 +248,20 @@ bool RSA_key_generation(mpz_t p, mpz_t q, mpz_t Public_Modulo, mpz_t Private_Key
     // e x d = 1 (mod (phi of n)) --> e = 65537 there is a 1 in 32768 chance that e is not coprime with phi of n
     if (!mpz_invert(Private_Key, e, phi)) {
         printf("Phi and e are not coprime please regenerate your primes.\n");
-        return 1;
+        mpz_clear(qd);
+        mpz_clear(pd);
+        mpz_clear(phi);
+        mpz_clear(e);
+        return false;
     };
 
     mpz_clear(qd);
     mpz_clear(pd);
     mpz_clear(phi);
     mpz_clear(e);
-    mpz_clear(d);
 
     printf("Succesfully generated key pairs.\n");
-    return 0;
+    return true;
 };
 
 bool RSA_test(int m) {
@@ -296,10 +297,9 @@ bool RSA_test(int m) {
         generate_random_prime_number(rn, rsan2);
 
         // Generate Private/Public Key pair
-        bool is_safe = RSA_safe_prime_check(rsan1, rsan2);
-        bool suc_key_gen = RSA_key_generation(rsan1, rsan2, PM, SK);
+        bool key_generated = RSA_key_generation(rsan1, rsan2, PM, SK);
 
-        if (!is_safe && !suc_key_gen) {
+        if (key_generated) {
             printf("Second Prime Generated.\n");
             printf("Primes are Valid.\n");
             break;

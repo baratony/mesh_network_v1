@@ -305,52 +305,84 @@ bool ftp_download(ftp_client_t *ftp,
                   const char *remote_file,
                   void (*write_cb)(uint8_t *data, uint16_t len))
 {
+    enum
+    {
+        FTP_DOWNLOAD_RETRIES = 3
+    };
+
     char buf[256];
-    uint8_t ip[4];
-    uint16_t port;
-
-    // Enter PASV
-    ftp_enter_pasv(ftp, ip, &port);
-
-    /* Open the DATA connection (socket 1) - separate from the control one. */
-    socket(FTP_DATA_SOCKET, Sn_MR_TCP, 6000, 0);
-
-    if (connect(FTP_DATA_SOCKET, ip, port) != SOCK_OK) {
-        return false;
-    }
-
-    // Send RETR command
-    sprintf(buf, "RETR %s", remote_file);
-    ftp_send_cmd(FTP_CTRL_SOCKET, buf);
-
-    /* NOTE the reply code is not checked. A missing file therefore still
-     * yields 'true' with zero bytes delivered, which is exactly what
-     * radio_download_neighbor_file()/radio_is_new_node() rely on: 'no file'
-     * means 'brand new node', not 'error'. */
-    ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug);
-
-    /* Stream file: keep pulling whatever the data socket has buffered and
-     * forward each chunk straight to the caller's callback. The loop ends on
-     * a non-positive read, i.e. when the transfer is finished. */
     uint8_t data[1024];
 
-    while(1)
+    for (int attempt = 0; attempt <= FTP_DOWNLOAD_RETRIES; ++attempt)
     {
-        int len = recv(FTP_DATA_SOCKET, data, 1024);
+        uint8_t ip[4];
+        uint16_t port;
 
-        if(len <= 0)
-            break;
+        if (ftp_enter_pasv(ftp, ip, &port) != 0)
+            return false;
 
-        write_cb(data, len);
+        /* Open the DATA connection (socket 1) - separate from the control one. */
+        socket(FTP_DATA_SOCKET, Sn_MR_TCP, 6000, 0);
+
+        if (connect(FTP_DATA_SOCKET, ip, port) != SOCK_OK)
+            return false;
+
+        snprintf(buf, sizeof(buf), "RETR %s", remote_file);
+        ftp_send_cmd(FTP_CTRL_SOCKET, buf);
+
+        int transfer_code = ftp_read_reply(FTP_CTRL_SOCKET, buf, sizeof(buf), ftp->debug);
+        if (transfer_code == 550)
+        {
+            close(FTP_DATA_SOCKET);
+
+            if (attempt < FTP_DOWNLOAD_RETRIES)
+            {
+                if (ftp->debug)
+                    printf("[FTP] %s unavailable (550); retrying (%d/%d)\n",
+                           remote_file,
+                           attempt + 1,
+                           FTP_DOWNLOAD_RETRIES);
+                sleep_ms(100);
+                continue;
+            }
+
+            if (ftp->debug)
+                printf("[FTP] Giving up downloading %s after %d retries\n",
+                       remote_file,
+                       FTP_DOWNLOAD_RETRIES);
+            return false;
+        }
+
+        if (transfer_code != 125 && transfer_code != 150)
+        {
+            close(FTP_DATA_SOCKET);
+            if (ftp->debug)
+                printf("[FTP] RETR %s rejected (reply code %d)\n",
+                       remote_file,
+                       transfer_code);
+            return false;
+        }
+
+        /* Stream file bytes into the caller's bounded buffer. */
+        while (true)
+        {
+            int len = recv(FTP_DATA_SOCKET, data, sizeof(data));
+
+            if (len <= 0)
+                break;
+
+            write_cb(data, (uint16_t)len);
+        }
+
+        disconnect(FTP_DATA_SOCKET);
+
+        /* Consume the closing 'transfer complete' reply so the control channel
+         * stays in sync for the next command. */
+        int completion_code = ftp_read_reply(FTP_CTRL_SOCKET, buf, sizeof(buf), ftp->debug);
+        return completion_code == 226 || completion_code == 250;
     }
 
-    disconnect(FTP_DATA_SOCKET);
-
-    /* Consume the closing 'transfer complete' reply so the control channel
-     * stays in sync for the next command. */
-    ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug);
-
-    return true;
+    return false;
 }
 
 
@@ -425,10 +457,12 @@ bool ftp_upload(ftp_client_t *ftp,
     sleep_ms(50);
 
     int final_code = ftp_read_reply(FTP_CTRL_SOCKET, buf, sizeof(buf), ftp->debug);
-    printf("%d", final_code);   /* leftover debug print, not gated by ftp->debug */
-    /* -2 (timeout) is accepted on purpose: a slow server that already took
-     * the bytes is not treated as a failure, so the mesh keeps going. */
-    if (final_code != 226 && final_code != 250 && final_code != 200 && final_code != -2) {
+    if (final_code != 226 && final_code != 250 && final_code != 200) {
+        if (ftp->debug) {
+            printf("[FTP] Upload of %s did not complete (reply code %d)\n",
+                   remote_file,
+                   final_code);
+        }
         return false;
     }
 

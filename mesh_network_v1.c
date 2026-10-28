@@ -25,13 +25,15 @@
 #include "Radio/radio.h"
 #include "Radio/radio_packet_protocol.h"
 #include "Cryptographic_Functions/Cryptographic_Functions.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
 
 /* ---------------------------------------------------------------------------
  * 1. Node configuration
  * --------------------------------------------------------------------------- */
 
 /* E32 module: UART data lines + M0/M1 control lines. */
-#define RADIO_UART        uart1
+#define RADIO_UART        uart0
 #define RADIO_TX_PIN      0
 #define RADIO_RX_PIN      1
 #define RADIO_M0_PIN      6
@@ -50,7 +52,7 @@
 
 /* File that keeps this node's own RSA key pair. */
 #define NODE_KEY_FILE       "node_rsa_key.txt"
-#define NODE_KEY_FILE_MAX   1024
+#define NODE_KEY_FILE_MAX   1400
 
 /* ---------------------------------------------------------------------------
  * 1b. The numbers the home page shows
@@ -91,10 +93,10 @@
 
 /* Replace these placeholders with the FTP server's connection details. */
 static ftp_client_t node_ftp = {
-    .server_ip = "//PLACE HOLDER//",
+    .server_ip = "192.168.12.103",
     .port = 21,
-    .username = "//PLACE HOLDER//",
-    .password = "//PLACE HOLDER//",
+    .username = "PLACE HOLDER",
+    .password = "PLACE HOLDER",
     .debug = 1,
 };
 
@@ -123,6 +125,12 @@ static mutex_t network_lock;
 
 static void network_lock_enter(void) { mutex_enter_blocking(&network_lock); }
 static void network_lock_exit(void)  { mutex_exit(&network_lock); }
+
+enum
+{
+    FTP_STARTUP_FAILED = 0x46545030u,
+    FTP_STARTUP_READY  = 0x46545031u
+};
 
 /* ---------------------------------------------------------------------------
  * 3. Small helpers
@@ -632,34 +640,28 @@ static void key_file_cb(uint8_t *data, uint16_t length)
     key_file_text[key_file_length] = '\0';
 }
 
-/* The generator is shared by the boot sequence and by "Regenerate Keys", so
- * it is declared first and takes the network lock from its caller. */
+/* Key loading/generation is called with the network lock held. The generator
+ * is also shared with "Regenerate Keys", so declare it before the loader. */
 static bool node_generate_rsa_keypair(void);
 
 static bool node_load_or_generate_rsa_keypair(void)
 {
-    char modulus_text[512];
-    char exponent_text[512];
-
-    network_lock_enter();
+    char modulus_text[700];
+    char exponent_text[700];
 
     key_file_length = 0;
     key_file_text[0] = '\0';
 
     if (ftp_download(&node_ftp, NODE_KEY_FILE, key_file_cb) &&
-        sscanf(key_file_text, "%511s %511s", modulus_text, exponent_text) == 2 &&
+        sscanf(key_file_text, "%699s %699s", modulus_text, exponent_text) == 2 &&
         mpz_set_str(rsa_public_modulus, modulus_text, 10) == 0 &&
         mpz_set_str(rsa_private_exponent, exponent_text, 10) == 0)
     {
         printf("[NODE] RSA key pair loaded from %s\n", NODE_KEY_FILE);
-        network_lock_exit();
         return true;
     }
 
-    bool generated = node_generate_rsa_keypair();
-
-    network_lock_exit();
-    return generated;
+    return node_generate_rsa_keypair();
 }
 
 /* Build a fresh RSA key pair and store it. The caller must already hold the
@@ -667,6 +669,12 @@ static bool node_load_or_generate_rsa_keypair(void)
  * "Regenerate Keys" button. */
 static bool node_generate_rsa_keypair(void)
 {
+    enum
+    {
+        RSA_PRIME_BITS = 1024,
+        RSA_KEYGEN_ATTEMPTS = 16
+    };
+
     mpz_t p;
     mpz_t q;
     mpz_t seed;
@@ -676,20 +684,31 @@ static bool node_generate_rsa_keypair(void)
     mpz_init(q);
     mpz_init(seed);
     mpz_init(random);
+    bool key_generated = false;
 
-    for (int attempt = 0; attempt < 8; ++attempt)
+    for (int attempt = 0; attempt < RSA_KEYGEN_ATTEMPTS; ++attempt)
     {
         generate_random_seed(seed, 256);
-        generate_random_number(seed, random, 1028, 256);
+        generate_random_number(seed, random, RSA_PRIME_BITS, 256);
+        mpz_setbit(random, RSA_PRIME_BITS - 1);
+        mpz_setbit(random, 0);
         generate_random_prime_number(random, p);
 
         generate_random_seed(seed, 256);
-        generate_random_number(seed, random, 1028, 256);
+        generate_random_number(seed, random, RSA_PRIME_BITS, 256);
+        mpz_setbit(random, RSA_PRIME_BITS - 1);
+        mpz_setbit(random, 0);
         generate_random_prime_number(random, q);
 
-        if (RSA_safe_prime_check(p, q) &&
-            RSA_key_generation(p, q, rsa_public_modulus, rsa_private_exponent))
+        if (mpz_sizeinbase(p, 2) == RSA_PRIME_BITS &&
+            mpz_sizeinbase(q, 2) == RSA_PRIME_BITS &&
+            mpz_cmp(p, q) != 0 &&
+            RSA_key_generation(p, q, rsa_public_modulus, rsa_private_exponent) &&
+            mpz_sizeinbase(rsa_public_modulus, 2) == 2048)
+        {
+            key_generated = true;
             break;
+        }
     }
 
     mpz_clear(p);
@@ -697,7 +716,7 @@ static bool node_generate_rsa_keypair(void)
     mpz_clear(seed);
     mpz_clear(random);
 
-    if (mpz_sizeinbase(rsa_public_modulus, 2) != 2048)
+    if (!key_generated)
     {
         printf("[NODE] RSA key generation failed\n");
         return false;
@@ -707,16 +726,33 @@ static bool node_generate_rsa_keypair(void)
     char *exponent_str = mpz_get_str(NULL, 10, rsa_private_exponent);
 
     if (modulus_str == NULL || exponent_str == NULL)
+    {
+        free(modulus_str);
+        free(exponent_str);
         return false;
+    }
 
-    char file[512];
+    char file[NODE_KEY_FILE_MAX];
     int length = snprintf(file, sizeof(file), "%s %s\n", modulus_str, exponent_str);
 
     free(modulus_str);
     free(exponent_str);
 
-    if (length > 0)
-        ftp_upload(&node_ftp, NODE_KEY_FILE, (uint8_t *)file, (uint32_t)length);
+    if (length <= 0 || (size_t)length >= sizeof(file))
+    {
+        printf("[NODE] Could not format the RSA key pair for storage\n");
+        return false;
+    }
+
+    if (!ftp_upload(&node_ftp,
+                    NODE_KEY_FILE,
+                    (uint8_t *)file,
+                    (uint32_t)length))
+    {
+        printf("[NODE] Could not save %s to the FTP server; check the FTP user's write permission and directory\n",
+               NODE_KEY_FILE);
+        return false;
+    }
 
     /* Our own modulus is not written into the ledger here: it is published
      * with Relay_RSA_Public_Key, which every neighbour's
@@ -1540,6 +1576,20 @@ static void service_pending_site_actions(void)
 static bool site_snapshot_due_valid = false;
 static absolute_time_t site_snapshot_due;
 
+/* Keep draining and logging the radio UART if normal mesh startup cannot
+ * continue. The packet decoder prints every byte before validating frames. */
+static void radio_debug_monitor(void)
+{
+    printf("[RADIO] Entering receive-only debug monitor.\n");
+
+    while (true)
+    {
+        radio_packet_t packet;
+        (void)radio_receive_packet(&radio, &packet);
+        sleep_ms(1);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * 11. Core 1 - the radio
  * --------------------------------------------------------------------------- */
@@ -1553,31 +1603,56 @@ void second_core_code(void)
     e32_set_mode(&radio, E32_MODE_NORMAL);
     e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
-    printf("[CORE1] E32 radio is ready.\n");
+    printf("[CORE 1] E32 radio is ready.\n");
 
     /* The FTP client runs on this core. */
     network_lock_enter();
 
     if (!ftp_connect(&node_ftp))
     {
-        printf("[CORE1] FTP connection failed due to invalid IP address or other network credetials, the node cannot join the mesh\n");
+        printf("[CORE 1] FTP connection failed due to invalid IP address or other network credetials, the node cannot join the mesh\n");
+
+        for (int i = 0; i < 5; i++)
+        {
+            sleep_ms(1000);
+            printf("[CORE 1] Attempting to connect to the FTP server again.\n");
+            ftp_connect(&node_ftp);
+        }
+
         network_lock_exit();
-        return;
+        multicore_fifo_push_blocking(FTP_STARTUP_FAILED);
+        printf("[CORE 1] FTP connection failed due to invalid IP address or other network credetials, the node cannot join the mesh\n");
+  //      radio_debug_monitor();
     }
 
     if (!ftp_login(&node_ftp))
     {
-        printf("[CORE1] FTP connection failed due to incorrect login username or password, the node cannot join the mesh\n");
+        printf("[CORE 1] FTP connection failed due to incorrect login username or password, the node cannot join the mesh\n");
+
+        for (int i = 0; i < 5; i++)
+        {
+            sleep_ms(1000);
+            printf("[CORE 1] Attempting to connect to the FTP server again.\n");
+            ftp_connect(&node_ftp);
+        }
+
         network_lock_exit();
-        return;
+        multicore_fifo_push_blocking(FTP_STARTUP_FAILED);
+        printf("[CORE 1] FTP connection failed due to incorrect login username or password, the node cannot join the mesh\n");
+   //     radio_debug_monitor();
     }
+
+    printf("[CORE 1] FTP connection succseful.\n");
+    multicore_fifo_push_blocking(FTP_STARTUP_READY);
 
     if (!node_load_or_generate_rsa_keypair())
     {
+        printf("[CORE 1] node_load_or_generate_rsa_keypair.\n");
         network_lock_exit();
-        return;
+  //      radio_debug_monitor();
     }
 
+    printf("[CORE 1] checking if new node.\n");
     /* Brand new node? local_neighbors.txt is missing, empty or invalid. */
     bool new_node = radio_is_new_node(&node_ftp);
 
@@ -1585,15 +1660,27 @@ void second_core_code(void)
 
     if (new_node)
     {
-        printf("[CORE 1] New Node Detected! Starting intilization process.");
-        if (!join_mesh_as_new_node())
-            return;
+        printf("[CORE 1] New Node Detected! Starting intilization process.\n");
+        bool joined = join_mesh_as_new_node();
+
+        for (int i = 0; i < 5 && !joined; i++)
+        {
+            printf("[CORE 1] Attempting network join again.\n");
+            sleep_ms(10);
+            joined = join_mesh_as_new_node();
+        }
+
+        if (!joined)
+        {
+            printf("[CORE 1] Could not join the mesh after multiple attempts.\n");
+  //          radio_debug_monitor();
+        }
     }
     else
     {
         /* We already belong to the mesh: read the neighbour list again and
            re-claim a local address. */
-        printf("[CORE 1] Previous node registered, enetering normal operartion.");
+        printf("[CORE 1] Previous node registered, enetering normal operartion.\n");
         network_lock_enter();
 
         node_local_address = Generate_Local_Adress(node_global_address, &radio, &node_ftp);
@@ -1643,8 +1730,9 @@ void second_core_code(void)
         }
 
         if (!packet_is_for_us(&packet))
-            printf("[CORE 1] Packet Recieved.");
             continue;
+
+        printf("[CORE 1] Packet Received.\n");
 
         if (packet_already_seen(&packet))
             continue;
@@ -1659,9 +1747,13 @@ void second_core_code(void)
 
 int main(void)
 {
+
+    vreg_set_voltage(VREG_VOLTAGE_1_25);
+    set_sys_clock_khz(200000, true);
+
     stdio_init_all();
     sleep_ms(8000);
-    printf("Booting....");
+    printf("Booting....\n");
 
     mutex_init(&network_lock);
 
@@ -1681,8 +1773,8 @@ int main(void)
         .reset_pin = 20,
     };
 
+    printf("[CORE 0] Setting Up W5500.\n");
     init_w5500(&w5500);
-    http_server_init();
 
     /* The global address is built from the RTC, so the clock must run and be
        set to the node creation date. */
@@ -1704,11 +1796,55 @@ int main(void)
     for (uint output = OUTPUT_FIRST_PIN; output <= OUTPUT_LAST_PIN; ++output)
         gpio_init(output), gpio_set_dir(output, GPIO_OUT);
 
+    sleep_ms(1000);
+
+    printf("[CORE 0] Launching core 1 to connect to FTP.\n");
     multicore_launch_core1(second_core_code);
+
+    uint32_t ftp_startup_status = multicore_fifo_pop_blocking();
+    if (ftp_startup_status == FTP_STARTUP_FAILED)
+        printf("[CORE 0] FTP startup failed; starting the HTTP website anyway.\n");
+
+    network_lock_enter();
+    printf("[CORE 0] Setting Up HTTP server.\n");
+    http_server_init();
+    network_lock_exit();
+
+
+    // e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
+    // e32_set_mode(&radio, E32_MODE_WAKEUP);
+    // sleep_ms(100);
+    // e32_set_mode(&radio, E32_MODE_NORMAL);
+    // e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
+
+
+    // for(int i = 0; i < 10; i++)
+    // {
+    //     sleep_ms(1000);
+    //     printf("Sending radio packet.\n");
+    //     radio_packet_t ping_packet;
+    //     radio_packet_create(
+    //         &ping_packet,
+    //         node_global_address,        // Global source
+    //         0xFFFFFFFF,           // Global destination, aka everyone in radio range
+    //         RADIO_CMD_PING,           // Command
+    //         RADIO_FLAG_ACK_REQUEST,   // Ask nodes to respond
+    //         1                         // Sequence number
+    //     );
+
+    //     radio_send_packet(
+    //         &radio,
+    //         &ping_packet,
+    //         0xFFFF,                   // E32 broadcast address
+    //         0                         // E32 channel
+    //     );
+    // }
 
     while (true)
     {
+        network_lock_enter();
         http_server_poll();
+        network_lock_exit();
         sleep_ms(10);
     }
 }

@@ -87,6 +87,7 @@ target_link_libraries(mesh_network_v1
     hardware_gpio
     hardware_rtc
     hardware_uart
+    hardware_regs
     pico_multicore
     pico_mbedtls
     pico_rand)
