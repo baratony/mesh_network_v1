@@ -49,8 +49,10 @@ void e32_init(
     dev->m1_pin=m1;
 
 
-    /* 9600 baud is the E32's documented connector speed. */
-    uart_init(uart,9600);
+    /* Open the Pico's UART at the rate the radio is about to be configured
+     * for. E32_UART_BAUD and E32_TRANSPORT_SETTINGS are one setting seen
+     * from both sides; see ebyte_e32.h for why they must agree. */
+    uart_init(uart,E32_UART_BAUD);
 
     /* Make the two Pico GPIOs act as that UART's data lines, so the radio's
      * wires plug straight into them. */
@@ -349,7 +351,7 @@ void e32_write_config(
     cfg[2]=address&0xFF;
 
 
-    cfg[3]=0x44;   // default UART/air settings
+    cfg[3]=E32_TRANSPORT_SETTINGS;   /* the connector at E32_UART_BAUD */
 
 
     cfg[4]=channel;

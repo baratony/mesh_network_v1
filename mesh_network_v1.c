@@ -1551,6 +1551,27 @@ void second_core_code(void)
     e32_set_mode(&radio, E32_MODE_WAKEUP);
     sleep_ms(100);
     e32_set_mode(&radio, E32_MODE_NORMAL);
+
+    /* Ask the radio what it really is set to before we change anything, and
+     * say it out loud. The transport byte it reports is the one number that
+     * has to agree with E32_UART_BAUD; printing it here is what turns a
+     * garbled-packet mystery into a line in the log you can read. It also
+     * parks the device in SLEEP, which e32_write_config() then undoes. The
+     * read itself blocks until the device answers, so once the number is
+     * confirmed and the line is no longer needed, drop this call rather
+     * than leave a boot that depends on the radio replying. */
+    uint8_t device_config[6];
+    e32_read_config(&radio, device_config);
+
+    printf("[CORE1] E32 reports address %02X%02X transport %02X channel %02X, "
+           "we asked for %02X\n",
+           device_config[0], device_config[1], device_config[2], device_config[3],
+           (unsigned)E32_TRANSPORT_SETTINGS);
+
+    if (device_config[2] != (uint8_t)E32_TRANSPORT_SETTINGS)
+        printf("[CORE1] The radio's rate and the Pico's UART disagree: packets "
+               "will arrive as bytes that never decode\n");
+
     e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
     printf("[CORE1] E32 radio is ready.\n");
