@@ -25,6 +25,11 @@
 #define CMD_READ   0xC1
 #define CMD_WRITE  0xC0
 
+/* E32 SPED fields: UART baud (bits 7-5), parity (bits 4-3), air rate
+ * (bits 2-0). 0x62 selects 9600 baud, 8N1, and 2.4 kbps air rate, matching
+ * e32_init(), which configures the Pico UART at 9600 baud with 8N1 framing. */
+#define E32_SPED_9600_8N1_2K4 0x62
+
 
 
 /* Boot-time wiring, called once from second_core_code().
@@ -351,7 +356,11 @@ void e32_write_config(
     cfg[2]=address&0xFF;
 
 
+<<<<<<< HEAD
     cfg[3]=E32_TRANSPORT_SETTINGS;   /* the connector at E32_UART_BAUD */
+=======
+    cfg[3] = E32_SPED_9600_8N1_2K4;
+>>>>>>> refs/remotes/origin/main
 
 
     cfg[4]=channel;

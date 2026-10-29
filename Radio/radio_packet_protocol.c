@@ -12,8 +12,15 @@
  * ==========================================================================*/
 #include "radio_packet_protocol.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <limits.h>
+
+/* Set to 0 to disable byte-by-byte UART logging. Override at build time with
+ * -DRADIO_DEBUG_RAW_BYTES=0 when printf overhead interferes with reception. */
+#ifndef RADIO_DEBUG_RAW_BYTES
+#define RADIO_DEBUG_RAW_BYTES 1
+#endif
 
 /* One reassembly buffer per E32 device. The program only ever has one radio
  * (`e32_t radio`), but keeping a table means the same code would work if a
@@ -563,10 +570,16 @@ bool radio_send_packet(e32_t *dev,
                        uint8_t channel)
 {
     if (dev == NULL || packet == NULL)
+    {
+        printf("[RADIO TX] No radio object or packet to send.\n");
         return false;
+    }
 
     if (packet->length > RADIO_MAX_DATA)
+    {
+        printf("[RADIO TX] Radio packet to large to send.\n");
         return false;
+    }
 
     /* A global broadcast is also an E32 broadcast unless the caller is
        deliberately routing it through a particular next-hop radio.
@@ -584,7 +597,10 @@ bool radio_send_packet(e32_t *dev,
         sizeof(encoded));
 
     if (encoded_length == 0)
+    {
+        printf("[RADIO TX] Radio packet encoded length is 0, not sending.\n");
         return false;
+    }
 
     e32_send_fixed(dev,
                    e32_destination,
@@ -625,6 +641,9 @@ bool radio_receive_packet(e32_t *dev,
     while (uart_is_readable(dev->uart))
     {
         uint8_t byte = uart_getc(dev->uart);
+#if RADIO_DEBUG_RAW_BYTES
+        printf("[RADIO UART RX] %02X\n", (unsigned)byte);
+#endif
 
         /* PHASE 1 - hunting for the start byte. Garbage between packets
          * (radio noise, a truncated tail) is simply skipped here. */
@@ -707,6 +726,12 @@ bool radio_receive_packet(e32_t *dev,
         if (state->expected_length > 0 &&
             state->position == state->expected_length)
         {
+            printf("[RADIO RX] %u bytes:",
+                   (unsigned)state->expected_length);
+            for (uint16_t i = 0; i < state->expected_length; ++i)
+                printf(" %02X", (unsigned)state->buffer[i]);
+            printf("\n");
+
             bool valid = radio_packet_decode(state->buffer,
                                               state->expected_length,
                                               packet);

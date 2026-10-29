@@ -20,6 +20,7 @@ void generate_random_number(mpz_t seed, mpz_t random_number,
 void generate_random_prime_number(mpz_t random_start, mpz_t rsa_num);
 
 bool RSA_safe_prime_check(mpz_t prime_one, mpz_t prime_two);
+/* Returns true only when the public and private keys were generated. */
 bool RSA_key_generation(mpz_t p, mpz_t q, mpz_t public_modulo,
                         mpz_t private_key);
 void RSA_encrypt(mpz_t message, mpz_t e_key, mpz_t public_modulo,

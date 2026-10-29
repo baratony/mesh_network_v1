@@ -1054,11 +1054,13 @@ bool radio_download_neighbor_file(ftp_client_t *ftp)
 bool radio_is_new_node(ftp_client_t *ftp)
 {
     if (!radio_download_neighbor_file(ftp))
+        printf("[CORE 1] Downloading Neighbor file.\n");
         return true;
 
     radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
     uint8_t neighbor_count = 0;
 
+    printf("[CORE 1] Parsing Neighbor file.\n");
     return !radio_parse_neighbor_file(neighbors, &neighbor_count);
 }
 
@@ -3232,6 +3234,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
         1                         // Sequence number
     );
 
+    printf("[RADIO] Sending Find Neighbors packet.\n");
     radio_send_packet(
         radio,
         &ping_packet,
