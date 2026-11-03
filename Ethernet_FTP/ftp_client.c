@@ -173,10 +173,8 @@ bool ftp_connect(ftp_client_t *ftp)
     return true;
 }
 
-/* Send USER/PASS and confirm the server accepted them.
- *
- * The double check is deliberate: some servers answer USER with 331 'send the
- * password', others skip straight to 230 'logged in'. Both are success. */
+/* Send USER/PASS and confirm the server accepted them. Some servers answer
+ * USER with 331 'send the password', while others return 230 immediately. */
 bool ftp_login(ftp_client_t *ftp)
 {
     char buf[256];
@@ -185,17 +183,17 @@ bool ftp_login(ftp_client_t *ftp)
     sprintf(buf, "USER %s", ftp->username);
     ftp_send_cmd(FTP_CTRL_SOCKET, buf);
 
-    if(ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug) != 331)
-    {
-        if(ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug) != 230)
-            return false;
-    }
+    int code = ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug);
+    if (code == 230)
+        return true;
+    if (code != 331)
+        return false;
 
     // PASS
     sprintf(buf, "PASS %s", ftp->password);
     ftp_send_cmd(FTP_CTRL_SOCKET, buf);
 
-    int code = ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug);
+    code = ftp_read_reply(FTP_CTRL_SOCKET, buf, 256, ftp->debug);
 
     return (code == 230);
 }

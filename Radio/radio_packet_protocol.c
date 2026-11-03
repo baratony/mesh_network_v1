@@ -602,6 +602,9 @@ bool radio_send_packet(e32_t *dev,
         return false;
     }
 
+    printf("Packet bytes before sending:\n");
+    radio_print_packet_bytes(packet);
+
     e32_send_fixed(dev,
                    e32_destination,
                    channel,

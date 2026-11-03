@@ -95,8 +95,8 @@
 static ftp_client_t node_ftp = {
     .server_ip = "192.168.12.103",
     .port = 21,
-    .username = "PLACE HOLDER",
-    .password = "PLACE HOLDER",
+    .username = "baratony",
+    .password = "zhz86603",
     .debug = 1,
 };
 
@@ -1598,79 +1598,52 @@ void second_core_code(void)
 {
     /* Wake the E32 module. */
     e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
-    e32_set_mode(&radio, E32_MODE_WAKEUP);
+//    e32_set_mode(&radio, E32_MODE_WAKEUP);
     sleep_ms(100);
     e32_set_mode(&radio, E32_MODE_NORMAL);
 
-    /* Ask the radio what it really is set to before we change anything, and
-     * say it out loud. The transport byte it reports is the one number that
-     * has to agree with E32_UART_BAUD; printing it here is what turns a
-     * garbled-packet mystery into a line in the log you can read. It also
-     * parks the device in SLEEP, which e32_write_config() then undoes. The
-     * read itself blocks until the device answers, so once the number is
-     * confirmed and the line is no longer needed, drop this call rather
-     * than leave a boot that depends on the radio replying. */
-    uint8_t device_config[6];
-    e32_read_config(&radio, device_config);
-
-    printf("[CORE1] E32 reports address %02X%02X transport %02X channel %02X, "
-           "we asked for %02X\n",
-           device_config[0], device_config[1], device_config[2], device_config[3],
-           (unsigned)E32_TRANSPORT_SETTINGS);
-
-    if (device_config[2] != (uint8_t)E32_TRANSPORT_SETTINGS)
-        printf("[CORE1] The radio's rate and the Pico's UART disagree: packets "
-               "will arrive as bytes that never decode\n");
-
-    e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
+//    e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
     printf("[CORE 1] E32 radio is ready.\n");
 
     /* The FTP client runs on this core. */
     network_lock_enter();
 
-    if (!ftp_connect(&node_ftp))
-    {
-        printf("[CORE 1] FTP connection failed due to invalid IP address or other network credetials, the node cannot join the mesh\n");
+    bool ftp_connected = false;
+    bool ftp_ready = false;
 
-        for (int i = 0; i < 5; i++)
+    for (int attempt = 0; attempt < 6 && !ftp_ready; ++attempt)
+    {
+        if (attempt > 0)
         {
             sleep_ms(1000);
             printf("[CORE 1] Attempting to connect to the FTP server again.\n");
-            ftp_connect(&node_ftp);
         }
 
-        network_lock_exit();
-        multicore_fifo_push_blocking(FTP_STARTUP_FAILED);
-        printf("[CORE 1] FTP connection failed due to invalid IP address or other network credetials, the node cannot join the mesh\n");
-  //      radio_debug_monitor();
+        ftp_connected = ftp_connect(&node_ftp);
+        if (ftp_connected)
+            ftp_ready = ftp_login(&node_ftp);
     }
 
-    if (!ftp_login(&node_ftp))
+    if (!ftp_ready)
     {
-        printf("[CORE 1] FTP connection failed due to incorrect login username or password, the node cannot join the mesh\n");
-
-        for (int i = 0; i < 5; i++)
-        {
-            sleep_ms(1000);
-            printf("[CORE 1] Attempting to connect to the FTP server again.\n");
-            ftp_connect(&node_ftp);
-        }
+        if (ftp_connected)
+            printf("[CORE 1] FTP login failed; check the server credentials.\n");
+        else
+            printf("[CORE 1] FTP connection failed; check the server address and network.\n");
 
         network_lock_exit();
         multicore_fifo_push_blocking(FTP_STARTUP_FAILED);
-        printf("[CORE 1] FTP connection failed due to incorrect login username or password, the node cannot join the mesh\n");
-   //     radio_debug_monitor();
+        return;
     }
 
-    printf("[CORE 1] FTP connection succseful.\n");
+    printf("[CORE 1] FTP connection successful.\n");
     multicore_fifo_push_blocking(FTP_STARTUP_READY);
 
     if (!node_load_or_generate_rsa_keypair())
     {
         printf("[CORE 1] node_load_or_generate_rsa_keypair.\n");
         network_lock_exit();
-  //      radio_debug_monitor();
     }
 
     printf("[CORE 1] checking if new node.\n");
@@ -1694,7 +1667,6 @@ void second_core_code(void)
         if (!joined)
         {
             printf("[CORE 1] Could not join the mesh after multiple attempts.\n");
-  //          radio_debug_monitor();
         }
     }
     else
@@ -1716,10 +1688,11 @@ void second_core_code(void)
     /* The pages need something to show before the first browser arrives, so
      * the snapshot is taken once here, right after the node is known to the
      * mesh. */
+
     network_lock_enter();
     site_publish_snapshot();
     network_lock_exit();
-
+    printf("[CORE 1] Dispaching packets.\n");
     /* Receive, sort and dispatch. */
     while (true)
     {
@@ -1753,7 +1726,7 @@ void second_core_code(void)
         if (!packet_is_for_us(&packet))
             continue;
 
-        printf("[CORE 1] Packet Received.\n");
+        printf("[CORE 1] Packet Received.\n");        
 
         if (packet_already_seen(&packet))
             continue;
@@ -1770,7 +1743,7 @@ int main(void)
 {
 
     vreg_set_voltage(VREG_VOLTAGE_1_25);
-    set_sys_clock_khz(200000, true);
+    set_sys_clock_khz(250000, true);
 
     stdio_init_all();
     sleep_ms(8000);
@@ -1817,49 +1790,64 @@ int main(void)
     for (uint output = OUTPUT_FIRST_PIN; output <= OUTPUT_LAST_PIN; ++output)
         gpio_init(output), gpio_set_dir(output, GPIO_OUT);
 
-    sleep_ms(1000);
+    // sleep_ms(1000);
 
-    printf("[CORE 0] Launching core 1 to connect to FTP.\n");
-    multicore_launch_core1(second_core_code);
+    // printf("[CORE 0] Launching core 1 to connect to FTP.\n");
+    // multicore_launch_core1(second_core_code);
 
-    uint32_t ftp_startup_status = multicore_fifo_pop_blocking();
-    if (ftp_startup_status == FTP_STARTUP_FAILED)
-        printf("[CORE 0] FTP startup failed; starting the HTTP website anyway.\n");
+    // uint32_t ftp_startup_status = multicore_fifo_pop_blocking();
+    // if (ftp_startup_status == FTP_STARTUP_FAILED)
+    //     printf("[CORE 0] FTP startup failed; starting the HTTP website anyway.\n");
 
-    network_lock_enter();
-    printf("[CORE 0] Setting Up HTTP server.\n");
-    http_server_init();
-    network_lock_exit();
-
-
-    // e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
-    // e32_set_mode(&radio, E32_MODE_WAKEUP);
-    // sleep_ms(100);
-    // e32_set_mode(&radio, E32_MODE_NORMAL);
-    // e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
+    // network_lock_enter();
+    // printf("[CORE 0] Setting Up HTTP server.\n");
+    // http_server_init();
+    // network_lock_exit();
 
 
-    // for(int i = 0; i < 10; i++)
-    // {
-    //     sleep_ms(1000);
-    //     printf("Sending radio packet.\n");
-    //     radio_packet_t ping_packet;
-    //     radio_packet_create(
-    //         &ping_packet,
-    //         node_global_address,        // Global source
-    //         0xFFFFFFFF,           // Global destination, aka everyone in radio range
-    //         RADIO_CMD_PING,           // Command
-    //         RADIO_FLAG_ACK_REQUEST,   // Ask nodes to respond
-    //         1                         // Sequence number
-    //     );
+    e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
+ //   e32_set_mode(&radio, E32_MODE_WAKEUP);
+    sleep_ms(100);
+    e32_set_mode(&radio, E32_MODE_NORMAL);
+   // e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
-    //     radio_send_packet(
-    //         &radio,
-    //         &ping_packet,
-    //         0xFFFF,                   // E32 broadcast address
-    //         0                         // E32 channel
-    //     );
-    // }
+
+    for(int i = 0; i < 5; i++)
+    {
+        sleep_ms(1000);
+        printf("Sending radio packet.\n");
+        radio_packet_t ping_packet;
+        radio_packet_create(
+            &ping_packet,
+            node_global_address,        // Global source
+            0xFFFFFFFF,           // Global destination, aka everyone in radio range
+            RADIO_CMD_PING,           // Command
+            RADIO_FLAG_ACK_REQUEST,   // Ask nodes to respond
+            1                         // Sequence number
+        );
+
+        radio_send_packet(
+            &radio,
+            &ping_packet,
+            0xFFFF,                   // E32 broadcast address
+            0                         // E32 channel
+        );
+    }
+
+    char msg[]="Hello";
+
+    for (int i = 0; i < 5; i++)
+    {
+        sleep_ms(1000);
+        printf("Sending broadcast 2 packet.\n");
+        e32_send_broadcast(
+            &radio,
+            (uint8_t*)msg,
+            5
+        );
+    }
+
+    radio_debug_monitor();
 
     while (true)
     {

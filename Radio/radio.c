@@ -194,6 +194,33 @@ static uint32_t radio_read_u32_be(const uint8_t *data);
 static void radio_write_u16_be(uint8_t *data, uint16_t value);
 static void radio_write_u32_be(uint8_t *data, uint32_t value);
 
+void radio_print_packet_bytes(const radio_packet_t *packet)
+{
+    if (packet == NULL)
+    {
+        printf("[RADIO TX] Cannot print a null packet.\n");
+        return;
+    }
+
+    radio_packet_t packet_copy = *packet;
+    uint8_t encoded[RADIO_MAX_PACKET_SIZE];
+    uint16_t encoded_length = radio_packet_encode(
+        &packet_copy,
+        encoded,
+        sizeof(encoded));
+
+    if (encoded_length == 0)
+    {
+        printf("[RADIO TX] Cannot print packet: encoding failed.\n");
+        return;
+    }
+
+    printf("[RADIO TX] Encoded packet (%u bytes):", (unsigned)encoded_length);
+    for (uint16_t i = 0; i < encoded_length; ++i)
+        printf(" %02X", (unsigned)encoded[i]);
+    printf("\n");
+}
+
 /* FTP download callback for local_neighbors.txt.
  * ftp_download() hands us the file in pieces; this appends each piece to the
  * static buffer and flags an overflow so a truncated file can be rejected

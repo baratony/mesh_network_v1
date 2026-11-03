@@ -236,6 +236,9 @@ uint32_t radio_generate_global_address(uint16_t year,
  * stream and calls radio_packet_decode(). Nothing else touches the wire.
  * ------------------------------------------------------------------------- */
 
+/* Print the encoded packet frame as hexadecimal bytes. */
+void radio_print_packet_bytes(const radio_packet_t *packet);
+
 /* Start a new message. Sets path[0]=source and, for a real (non-self) target,
  * path[1]=destination, i.e. a one-hop route by default. Handlers that route
  * over several nodes call radio_packet_set_path() afterwards. */

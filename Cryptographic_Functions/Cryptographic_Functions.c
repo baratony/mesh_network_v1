@@ -155,7 +155,7 @@ void generate_random_prime_number(mpz_t random_start, mpz_t rsa_num) {
             }
         }
 
-        is_prime = mpz_probab_prime_p(rsa_num, 5);
+        is_prime = mpz_probab_prime_p(rsa_num, 14);
 
         /* if probable prime, we're close done */
         if (is_prime > 0) {
