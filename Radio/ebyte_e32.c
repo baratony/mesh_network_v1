@@ -25,11 +25,9 @@
 #define CMD_READ   0xC1
 #define CMD_WRITE  0xC0
 
-/* E32 SPED fields: UART baud (bits 7-5), parity (bits 4-3), air rate
- * (bits 2-0). 0x62 selects 9600 baud, 8N1, and 2.4 kbps air rate, matching
- * e32_init(), which configures the Pico UART at 9600 baud with 8N1 framing. */
-#define E32_SPED_9600_8N1_2K4 0x62
-#define E32_OPTION_FIXED_TRANSMISSION 0x80u /* E32-433T30D OPTION bit 7 */
+/* The SPED and OPTION bytes the config record carries are named in ebyte_e32.h
+ * next to the field layout that explains them, so both sides of the connector
+ * are defined in one place. */
 
 
 
@@ -56,14 +54,22 @@ void e32_init(
 
 
     /* Open the Pico's UART at the rate the radio is about to be configured
-     * for. E32_UART_BAUD and E32_TRANSPORT_SETTINGS are one setting seen
+     * for. E32_UART_BAUD and E32_SPED_9600_8N1_2K4 are one setting seen
      * from both sides; see ebyte_e32.h for why they must agree. */
     uart_init(uart,E32_UART_BAUD);
 
-    /* Make the two Pico GPIOs act as that UART's data lines, so the radio's
-     * wires plug straight into them. */
-    gpio_set_function(tx,GPIO_FUNC_UART);
-    gpio_set_function(rx,GPIO_FUNC_UART);
+    /* Bind THIS uart to the radio's two connector wires.
+     *
+     * gpio_set_function() alone is not enough: it puts a pin into "UART
+     * function" but leaves the uart's own output and input where uart_init()
+     * put them, which are the SDK's defaults - pins 0 and 1 for uart0, but
+     * 22 and 23 for uart1. This program passes uart1 with pins 0 and 1, so
+     * without these two calls the bytes are written to pin 22 and read back
+     * from pin 23, and the wires in front of the radio are never the ones
+     * the Pico talks through. The reference program happens to use uart0,
+     * whose defaults already are pins 0 and 1, which is why it works. */
+    uart_set_output(uart,tx,UART_MODE_SIMPLEX);
+    uart_set_input(uart,rx,UART_MODE_PHYSICAL);
 
     /* M0/M1 are plain outputs, not part of the UART: they are the 2-bit
      * mode selector. */
@@ -357,7 +363,9 @@ void e32_write_config(
     cfg[2]=address&0xFF;
 
 
-  //  cfg[3]=E32_TRANSPORT_SETTINGS;   /* the connector at E32_UART_BAUD */
+    /* The rate the radio will use for the connector. This is the same
+     * setting e32_init() opened the Pico's UART at, spelled for the
+     * device's own field layout; see ebyte_e32.h. */
     cfg[3] = E32_SPED_9600_8N1_2K4;
 
 

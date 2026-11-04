@@ -34,32 +34,33 @@
 #include "hardware/uart.h"
 
 
-/* --- the connector's speed -----------------------------------------------
- * The Pico's UART and the E32's own transmit rate are ONE setting written in
- * two places: uart_init() on the Pico, and the transport byte of
- * e32_write_config() on the radio. Written twice as literals they drift apart
- * the moment either is edited, and the symptom of that drift is exactly what
- * a mismatched pair looks like: the AUX LEDs light, bytes arrive, and not one
- * of them decodes. The bits are all there - they are just spaced at the wrong
- * timing, so every byte the Pico assembles is garbage.
+/* --- the connector's framing ----------------------------------------------
+ * The Pico's UART and the E32's own connector framing are ONE setting written
+ * on both sides: uart_init() here, and the SPED byte of e32_write_config()
+ * on the radio. When the two disagree the result is exactly what a mismatched
+ * pair looks like: the AUX LEDs light, bytes arrive, and not one of them
+ * decodes. The bits are all there - they are just grouped at the wrong
+ * timing, and a parity bit the Pico does not expect shifts every byte.
  *
- * The transport byte of the config block is two halves. The high half picks
- * the transport, the low half is an index into the E32's own table of rates:
+ * The SPED byte of the config record is three fields, not a magic number:
  *
- *      index   0    1    2    3     4     5     6      7
- *             110  300  600 1200  2400  4800  9600  19200
+ *      bits 7-5   UART baud     000=110 001=300 010=600 011=9600
+ *      bits 4-3   parity        000 = 8N1 (what uart_init() gives)
+ *      bits 2-0   air rate      010 = 2.4 kbps
  *
- * So 9600 over the connector is 0x46. The value this file used to send,
- * 0x44, asks the radio for 2400 while the Pico is opened at 9600 - which is
- * the corruption seen on the wire. e32_read_config() at boot prints whatever
- * the device really holds, so if a radio disagrees with this table the number
- * to fix is visible rather than guessed.
+ * So 9600 8N1 is 0b011_000_xxx. The value this file used to send, 0x44,
+ * is 0b010_010_100: a 600-baud connector carrying a parity bit, against a
+ * Pico opened at 9600 8N1. That is the corruption seen on the wire, and it
+ * is why the reference program - which uploads no config at all and keeps
+ * the device's factory framing - works.
  * ----------------------------------------------------------------------- */
-#define E32_TRANSPORT_UART      0x40u
-#define E32_TRANSPORT_AIR       0x00u
-#define E32_BAUD_9600           0x06u
-#define E32_TRANSPORT_SETTINGS  (E32_TRANSPORT_UART | E32_BAUD_9600)
 #define E32_UART_BAUD           9600u
+#define E32_SPED_9600_8N1_2K4   0x62u   /* 0b011_000_010 */
+#define E32_OPTION_FIXED_TRANSMISSION 0x80u
+
+#ifdef E32_TRANSPORT_SETTINGS
+#undef E32_TRANSPORT_SETTINGS
+#endif
 
 /* The four hardware states of the E32, encoded as the two GPIO control pins
  * M0/M1. Waking the device is required at boot: a sleeping radio receives

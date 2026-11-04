@@ -1598,11 +1598,18 @@ void second_core_code(void)
 {
     /* Wake the E32 module. */
     e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
-//    e32_set_mode(&radio, E32_MODE_WAKEUP);
+
+    /* A dormant radio receives nothing, so bring it to life and let it
+     * settle before anything is put on the wire. */
+    e32_set_mode(&radio, E32_MODE_WAKEUP);
     sleep_ms(100);
     e32_set_mode(&radio, E32_MODE_NORMAL);
 
-//    e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
+    /* Give the device the address and the connector framing it must agree
+     * with. The SPED byte it is written with is the same rate e32_init()
+     * opened the Pico's UART at; see ebyte_e32.h for why the two have to
+     * match. */
+    e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
     printf("[CORE 1] E32 radio is ready.\n");
 
@@ -1806,10 +1813,16 @@ int main(void)
 
 
     e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
- //   e32_set_mode(&radio, E32_MODE_WAKEUP);
+
+    /* A dormant radio receives nothing, so bring it to life and let it
+     * settle before anything is put on the wire. */
+    e32_set_mode(&radio, E32_MODE_WAKEUP);
     sleep_ms(100);
     e32_set_mode(&radio, E32_MODE_NORMAL);
-   // e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
+
+    /* Same configuration upload as Core 1's boot: the connector framing has
+     * to match the Pico's UART or every byte on the wire garbles. */
+    e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
 
     for(int i = 0; i < 5; i++)
