@@ -96,7 +96,7 @@ void init_w5500(const ethernet_w5500_config_t *config)
 
     wiz_NetInfo netinfo = {
         .mac = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33},
-        .ip = {192, 168, 12, 200},
+        .ip = {192, 168, 12, 201},
         .sn = {255, 255, 255, 0},
         .gw = {192, 168, 12, 1},
         .dns = {8, 8, 8, 8},

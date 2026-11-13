@@ -30,6 +30,7 @@
 #define EBYTE_E32_H
 
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "hardware/uart.h"
 
@@ -48,11 +49,10 @@
  *      bits 4-3   parity        000 = 8N1 (what uart_init() gives)
  *      bits 2-0   air rate      010 = 2.4 kbps
  *
- * So 9600 8N1 is 0b011_000_xxx. The value this file used to send, 0x44,
- * is 0b010_010_100: a 600-baud connector carrying a parity bit, against a
- * Pico opened at 9600 8N1. That is the corruption seen on the wire, and it
- * is why the reference program - which uploads no config at all and keeps
- * the device's factory framing - works.
+ * So 9600 8N1 is 0b011_000_xxx. A setting such as 0x44 selects a different
+ * connector baud/parity and will corrupt bytes when paired with a Pico opened
+ * at 9600 8N1. Mesh traffic also uses fixed transmission, so OPTION must keep
+ * that mode enabled for e32_send_fixed()'s address/channel prefix.
  * ----------------------------------------------------------------------- */
 #define E32_UART_BAUD           9600u
 #define E32_SPED_9600_8N1_2K4   0x62u   /* 0b011_000_010 */
@@ -176,9 +176,9 @@ void e32_send_broadcast(
  * nothing in the mesh protocol calls it, but it is how you can verify on a
  * bench what address a radio actually holds. Parks the device in SLEEP first,
  * because a running radio would answer with traffic of its own. */
-void e32_read_config(
+bool e32_read_config(
     e32_t *dev,
-    uint8_t *config
+    uint8_t config[6]
 );
 
 

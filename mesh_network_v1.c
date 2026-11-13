@@ -38,10 +38,10 @@
 #define RADIO_RX_PIN      1
 #define RADIO_M0_PIN      6
 #define RADIO_M1_PIN      7
-#define RADIO_CHANNEL     0
+#define RADIO_CHANNEL     0 //Operates at 433mhz because manual specifies FREQ = 410 MHZ + CHAN MHZ
 #define E32_BROADCAST     0xFFFFu
 
-/* Control panel outputs driven by RADIO_CMD_SET_OUTPUT. */
+/* Control panel outputs driven by . */
 #define OUTPUT_FIRST_PIN  10
 #define OUTPUT_LAST_PIN   13
 
@@ -95,8 +95,8 @@
 static ftp_client_t node_ftp = {
     .server_ip = "192.168.12.103",
     .port = 21,
-    .username = "baratony",
-    .password = "zhz86603",
+    .username = "USERNAME_EXAMPLE",
+    .password = "PASSWORD_EXAMPLE",
     .debug = 1,
 };
 
@@ -444,6 +444,7 @@ static bool mesh_leg_is_ours(const radio_packet_t *packet)
 
 static void dispatch_packet(const radio_packet_t *packet)
 {
+    printf("[Core 1] Dispachining Packets\n");
     switch (packet->command)
     {
         /* --- application / control panel ---------------------------- */
@@ -453,26 +454,32 @@ static void dispatch_packet(const radio_packet_t *packet)
                           &radio,
                           &node_ftp,
                           *packet);
+            printf("[Core 1] Ping Response\n");
             break;
 
         case RADIO_CMD_PONG:
             handle_pong(packet);
+            printf("[Core 1] Pong Response\n");
             break;
 
         case RADIO_CMD_DATA:
             handle_data_packet(packet);
+            printf("[Core 1] Data Response\n");
             break;
 
         case RADIO_CMD_ACK:
             handle_ack(packet);
+            printf("[Core 1] Acknoledge Response\n");
             break;
 
         case RADIO_CMD_SET_OUTPUT:
             handle_set_output(packet);
+            printf("[Core 1] Output Response\n");
             break;
 
         case RADIO_CMD_GET_STATUS:
             handle_get_status(packet);
+            printf("[Core 1] Status Response\n");
             break;
 
         /* --- mesh protocol (handlers live in radio.c) --------------- */
@@ -481,6 +488,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                            &radio,
                                            &node_ftp,
                                            packet);
+            printf("[Core 1] Send Connections Response\n");
             break;
 
         case RADIO_CMD_SEND_LOCAL_ADRESS:
@@ -488,6 +496,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                     &radio,
                                     &node_ftp,
                                     packet);
+            printf("[Core 1] Send Local Response\n");
             break;
 
         case RADIO_CMD_REMOVE_LOCAL_ADDRESS:
@@ -495,6 +504,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                              &radio,
                                              &node_ftp,
                                              packet);
+            printf("[Core 1] Local Adress Removal Response\n");
             break;
 
         case RADIO_CMD_RECEIVE_GLOBAL_CONNECTIONS:
@@ -502,6 +512,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                                   &radio,
                                                   &node_ftp,
                                                   packet);
+            printf("[Core 1] Global Connections Request Response\n");
             break;
 
         case RADIO_CMD_RECEIVE_GLOBAL_RSA_KEYS:
@@ -509,6 +520,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                               &radio,
                                               &node_ftp,
                                               packet);
+            printf("[Core 1] Recieve Global RSA Keys Response\n");
             break;
 
         case RADIO_CMD_RELAY_NEW_NODE:
@@ -516,6 +528,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                 &radio,
                                 &node_ftp,
                                 packet);
+            printf("[Core 1] Relay New Node Response\n");
             break;
 
         case RADIO_CMD_RELAY_REMOVE_NODE:
@@ -523,6 +536,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                     &radio,
                                     &node_ftp,
                                     packet);
+            printf("[Core 1] Relay Remove Node Response\n");
             break;
 
         case RADIO_CMD_RELAY_RSA_KEYS:
@@ -530,6 +544,7 @@ static void dispatch_packet(const radio_packet_t *packet)
                                      &radio,
                                      &node_ftp,
                                      packet);
+            printf("[Core 1] Relay RSA Keys Response\n");
             break;
 
         case RADIO_CMD_SEND_ENCRYPTION_REQUEST:
@@ -538,6 +553,8 @@ static void dispatch_packet(const radio_packet_t *packet)
                 forward_mesh_fragment(packet);
                 break;
             }
+
+            printf("[Core 1] Send Encryption Request Response\n");
             /* The peer of a finished exchange is the node that sent us the
              * parameters, so it is recorded only when the handler actually
              * derived a secret. */
@@ -560,6 +577,9 @@ static void dispatch_packet(const radio_packet_t *packet)
                 forward_mesh_fragment(packet);
                 break;
             }
+
+            printf("[Core 1] Send Encryption Response\n");
+
             if (Respond_To_DH_Exchange_Response(node_global_address,
                                                 &radio,
                                                 &node_ftp,
@@ -587,6 +607,9 @@ static void dispatch_packet(const radio_packet_t *packet)
 
         /* --- the two message types the control panel can send ---------- */
         case RADIO_CMD_PRIVATE_MESSAGE:
+
+            printf("[Core 1] Private Message Response\n");
+
             Respond_To_Private_Message(node_global_address,
                                        &radio,
                                        &node_ftp,
@@ -597,6 +620,9 @@ static void dispatch_packet(const radio_packet_t *packet)
             break;
 
         case RADIO_CMD_PUBLIC_MESSAGE:
+
+            printf("[Core 1] Public Message Response\n");
+
             Respond_To_Public_Message(node_global_address,
                                       &radio,
                                       &node_ftp,
@@ -780,7 +806,7 @@ static bool join_mesh_as_new_node(void)
     network_lock_enter();
 
     /* 1. Discover the nodes in radio range and create local_neighbors.txt. */
-    Find_Neighbors(node_global_address, &radio, &node_ftp);
+    (node_global_address, &radio, &node_ftp);
 
     /* 2. Ask the neighbours for the addresses they already use and take a free
        one for ourselves. */
@@ -1646,6 +1672,7 @@ void second_core_code(void)
 
     printf("[CORE 1] FTP connection successful.\n");
     multicore_fifo_push_blocking(FTP_STARTUP_READY);
+    printf("[CORE 1] Checking if RSA key generation is necessary.\n");
 
     if (!node_load_or_generate_rsa_keypair())
     {
@@ -1667,7 +1694,7 @@ void second_core_code(void)
         for (int i = 0; i < 5 && !joined; i++)
         {
             printf("[CORE 1] Attempting network join again.\n");
-            sleep_ms(10);
+            sleep_ms(2000);
             joined = join_mesh_as_new_node();
         }
 
@@ -1797,70 +1824,86 @@ int main(void)
     for (uint output = OUTPUT_FIRST_PIN; output <= OUTPUT_LAST_PIN; ++output)
         gpio_init(output), gpio_set_dir(output, GPIO_OUT);
 
-    // sleep_ms(1000);
+    sleep_ms(1000);
 
-    // printf("[CORE 0] Launching core 1 to connect to FTP.\n");
-    // multicore_launch_core1(second_core_code);
+    printf("[CORE 0] Launching core 1 to connect to FTP.\n");
+    multicore_launch_core1(second_core_code);
 
-    // uint32_t ftp_startup_status = multicore_fifo_pop_blocking();
-    // if (ftp_startup_status == FTP_STARTUP_FAILED)
-    //     printf("[CORE 0] FTP startup failed; starting the HTTP website anyway.\n");
+    uint32_t ftp_startup_status = multicore_fifo_pop_blocking();
+    if (ftp_startup_status == FTP_STARTUP_FAILED)
+        printf("[CORE 0] FTP startup failed; starting the HTTP website anyway.\n");
 
-    // network_lock_enter();
-    // printf("[CORE 0] Setting Up HTTP server.\n");
-    // http_server_init();
-    // network_lock_exit();
-
-
-    e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
-
-    /* A dormant radio receives nothing, so bring it to life and let it
-     * settle before anything is put on the wire. */
-    e32_set_mode(&radio, E32_MODE_WAKEUP);
-    sleep_ms(100);
-    e32_set_mode(&radio, E32_MODE_NORMAL);
-
-    /* Same configuration upload as Core 1's boot: the connector framing has
-     * to match the Pico's UART or every byte on the wire garbles. */
-    e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
+    network_lock_enter();
+    printf("[CORE 0] Setting Up HTTP server.\n");
+    http_server_init();
+    network_lock_exit();
 
 
-    for(int i = 0; i < 5; i++)
-    {
-        sleep_ms(1000);
-        printf("Sending radio packet.\n");
-        radio_packet_t ping_packet;
-        radio_packet_create(
-            &ping_packet,
-            node_global_address,        // Global source
-            0xFFFFFFFF,           // Global destination, aka everyone in radio range
-            RADIO_CMD_PING,           // Command
-            RADIO_FLAG_ACK_REQUEST,   // Ask nodes to respond
-            1                         // Sequence number
-        );
+    // e32_init(&radio, RADIO_UART, RADIO_TX_PIN, RADIO_RX_PIN, RADIO_M0_PIN, RADIO_M1_PIN);
 
-        radio_send_packet(
-            &radio,
-            &ping_packet,
-            0xFFFF,                   // E32 broadcast address
-            0                         // E32 channel
-        );
-    }
+    // /* A dormant radio receives nothing, so bring it to life and let it
+    //  * settle before anything is put on the wire. */
+    // e32_set_mode(&radio, E32_MODE_WAKEUP);
+    // sleep_ms(300);
+    // e32_set_mode(&radio, E32_MODE_NORMAL);
 
-    char msg[]="Hello";
+    // uint8_t read_config[6] = {0};
+    // printf("Reading radio config before write.\n");
+    // if (e32_read_config(&radio, read_config)) {
+    //     printf("Radio config before write [C0 ADDH ADDL SPED CHAN OPTION]: "
+    //            "%02X %02X %02X %02X %02X %02X\n",
+    //            (unsigned int)read_config[0],
+    //            (unsigned int)read_config[1],
+    //            (unsigned int)read_config[2],
+    //            (unsigned int)read_config[3],
+    //            (unsigned int)read_config[4],
+    //            (unsigned int)read_config[5]);
+    // } else {
+    //     printf("Radio config read timed out before write; continuing with config write.\n");
+    // }
 
-    for (int i = 0; i < 5; i++)
-    {
-        sleep_ms(1000);
-        printf("Sending broadcast 2 packet.\n");
-        e32_send_broadcast(
-            &radio,
-            (uint8_t*)msg,
-            5
-        );
-    }
+    // /* Match the connector framing to the Pico UART, then continue booting. */
+    // e32_write_config(&radio, E32_BROADCAST, RADIO_CHANNEL);
 
-    radio_debug_monitor();
+    // if (e32_read_config(&radio, read_config)) {
+    //     printf("Radio config after write [C0 ADDH ADDL SPED CHAN OPTION]: "
+    //            "%02X %02X %02X %02X %02X %02X\n",
+    //            (unsigned int)read_config[0],
+    //            (unsigned int)read_config[1],
+    //            (unsigned int)read_config[2],
+    //            (unsigned int)read_config[3],
+    //            (unsigned int)read_config[4],
+    //            (unsigned int)read_config[5]);
+    // } else {
+    //     printf("Radio config read timed out after write.\n");
+    // }
+    // printf("Expected config: C0 FF FF %02X %02X %02X\n",
+    //        (unsigned int)E32_SPED_9600_8N1_2K4,
+    //        (unsigned int)RADIO_CHANNEL,
+    //        (unsigned int)E32_OPTION_FIXED_TRANSMISSION);
+
+    // for (int i = 0; i < 5; i++)
+    // {
+    //     sleep_ms(1000);
+    //     printf("Sending radio packet.\n");
+
+    //     radio_packet_t ping_packet;
+    //     if (!radio_packet_create(&ping_packet,
+    //                              node_global_address,
+    //                              0xFFFFFFFFu,
+    //                              RADIO_CMD_PING,
+    //                              RADIO_FLAG_ACK_REQUEST,
+    //                              (uint16_t)(i + 1)))
+    //     {
+    //         printf("[RADIO TX] Could not create ping packet.\n");
+    //         continue;
+    //     }
+
+    //     if (!radio_send_packet(&radio, &ping_packet, E32_BROADCAST, RADIO_CHANNEL))
+    //         printf("[RADIO TX] Could not send ping packet.\n");
+    // }
+
+    // radio_debug_monitor();
 
     while (true)
     {

@@ -32,33 +32,59 @@ int main()
         &radio,
         uart0,
         0,   // TX
-        1   // RX
+        1,
+        6,
+        7   // RX
     );
 
 
+    uint8_t read_config[6] = {0};
+    printf("Reading radio config before write.\n");
+    if (e32_read_config(&radio, read_config)) {
+        printf("Radio config before write [C0 ADDH ADDL SPED CHAN OPTION]: "
+               "%02X %02X %02X %02X %02X %02X\n",
+               (unsigned int)read_config[0],
+               (unsigned int)read_config[1],
+               (unsigned int)read_config[2],
+               (unsigned int)read_config[3],
+               (unsigned int)read_config[4],
+               (unsigned int)read_config[5]);
+    } else {
+        printf("Radio config read timed out before write; continuing with config write.\n");
+    }
+
+
+    e32_write_config(&radio);
+
+
+    printf("Reading radio config after write.\n");
+    if (e32_read_config(&radio, read_config)) {
+        printf("Radio config before write [C0 ADDH ADDL SPED CHAN OPTION]: "
+               "%02X %02X %02X %02X %02X %02X\n",
+               (unsigned int)read_config[0],
+               (unsigned int)read_config[1],
+               (unsigned int)read_config[2],
+               (unsigned int)read_config[3],
+               (unsigned int)read_config[4],
+               (unsigned int)read_config[5]);
+    } else {
+        printf("Radio config read timed out before write; continuing with config write.\n");
+    }
 
     char msg[]="Hello";
 
 
-    for (int i = 0; i < 10; i++)
-    {
-        sleep_ms(1000);
-        printf("Sent\n");
-        e32_send(
-            &radio,
-            (uint8_t*)msg,
-            5
-        );
-    }
-
-
-
-
+    absolute_time_t next_send = get_absolute_time();
     while(1)
     {
+        if (time_reached(next_send))
+        {
+            printf("Sent\n");
+            e32_send(&radio, (const uint8_t *)msg, sizeof(msg) - 1);
+            next_send = make_timeout_time_ms(1000);
+        }
 
         uint8_t buffer[64];
-        
         int len = e32_receive(
             &radio,
             buffer,
@@ -87,9 +113,7 @@ int main()
                     printf(".");
             }
 
-
             printf("\n");
-            tight_loop_contents();
         }
 
         tight_loop_contents();

@@ -80,6 +80,7 @@
  * offsets from these, so changing one changes all three consistently.
  * ----------------------------------------------------------------------- */
 #define RADIO_PACKET_START       0xAA   /* resync byte that starts every packet */
+#define RADIO_WIRE_ADDRESS_SIZE  4u     /* global addresses are 32-bit on wire */
 #define RADIO_MAX_ROUTE_ADDRESSES 16   /* hard cap on the route list          */
 #define RADIO_MAX_ROUTE_JUMPS    (RADIO_MAX_ROUTE_ADDRESSES - 1)
 #define RADIO_PACKET_FIXED_HEADER_SIZE 9 /* START + jump count + cmd + flags + seq + len */
@@ -87,7 +88,7 @@
 #define RADIO_MAX_DATA           256   /* payload cap = one E32 "fixed" frame */
 #define RADIO_PACKET_MAX_HEADER_SIZE \
     (RADIO_PACKET_FIXED_HEADER_SIZE + \
-     (RADIO_MAX_ROUTE_ADDRESSES * sizeof(uint32_t)))
+     (RADIO_MAX_ROUTE_ADDRESSES * RADIO_WIRE_ADDRESS_SIZE))
 #define RADIO_MAX_PACKET_SIZE \
     (RADIO_PACKET_MAX_HEADER_SIZE + RADIO_MAX_DATA + RADIO_PACKET_CRC_SIZE)
 

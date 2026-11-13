@@ -71,6 +71,11 @@ add_executable(mesh_network_v1
     Cryptographic_Functions/mini-gmp.c
 )
 
+option(RADIO_DEBUG_RX_BYTES "Print received radio packet bytes" TRUE)
+target_compile_definitions(mesh_network_v1 PRIVATE
+    RADIO_DEBUG_RX_BYTES=$<BOOL:${RADIO_DEBUG_RX_BYTES}>
+)
+
 pico_set_program_name(mesh_network_v1 "mesh_network_v1")
 pico_set_program_version(mesh_network_v1 "0.1")
 

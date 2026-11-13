@@ -58,18 +58,10 @@ void e32_init(
      * from both sides; see ebyte_e32.h for why they must agree. */
     uart_init(uart,E32_UART_BAUD);
 
-    /* Bind THIS uart to the radio's two connector wires.
-     *
-     * gpio_set_function() alone is not enough: it puts a pin into "UART
-     * function" but leaves the uart's own output and input where uart_init()
-     * put them, which are the SDK's defaults - pins 0 and 1 for uart0, but
-     * 22 and 23 for uart1. This program passes uart1 with pins 0 and 1, so
-     * without these two calls the bytes are written to pin 22 and read back
-     * from pin 23, and the wires in front of the radio are never the ones
-     * the Pico talks through. The reference program happens to use uart0,
-     * whose defaults already are pins 0 and 1, which is why it works. */
-    uart_set_output(uart,tx,UART_MODE_SIMPLEX);
-    uart_set_input(uart,rx,UART_MODE_PHYSICAL);
+    /* Select the requested UART function on the radio's TX/RX GPIOs instead
+     * of relying on the UART instance's default pin assignment. */
+    gpio_set_function(tx,UART_FUNCSEL_NUM(uart,tx));
+    gpio_set_function(rx,UART_FUNCSEL_NUM(uart,rx));
 
     /* M0/M1 are plain outputs, not part of the UART: they are the 2-bit
      * mode selector. */
@@ -280,49 +272,50 @@ void e32_send_broadcast(
 /* Debug helper: ask the device what address and channel it currently holds.
  * Not called anywhere in the mesh protocol - it exists so you can verify on a
  * bench that a radio was configured as intended. */
-void e32_read_config(
+bool e32_read_config(
     e32_t *dev,
-    uint8_t *config
+    uint8_t config[6]
 )
 {
-
-
     /* Park the radio first: while it is running, its own traffic would be
      * mixed into the reply we are about to read. */
-    e32_set_mode(
-        dev,
-        E32_MODE_SLEEP
-    );
+    e32_set_mode(dev, E32_MODE_SLEEP);
 
+    /* Discard stale bytes, such as a response to an earlier config write. */
+    while (uart_is_readable(dev->uart))
+        (void)uart_getc(dev->uart);
 
-    /* A 3-byte control request: opcode, first index, count of bytes wanted. */
-    uint8_t cmd[3];
+    /* E32 parameter reads use the C1 C1 C1 command sequence. */
+    const uint8_t cmd[3] = {CMD_READ, CMD_READ, CMD_READ};
+    uart_write_blocking(dev->uart, cmd, sizeof(cmd));
+    uart_tx_wait_blocking(dev->uart);
 
+    /* Bound the entire read so a missing response cannot hang startup. */
+    const absolute_time_t deadline = make_timeout_time_ms(250);
+    uint8_t response[6];
+    size_t received = 0;
+    while (received < sizeof(response)) {
+        int64_t remaining_us =
+            absolute_time_diff_us(get_absolute_time(), deadline);
+        if (remaining_us <= 0 ||
+            !uart_is_readable_within_us(dev->uart, (uint32_t)remaining_us))
+            break;
 
-    cmd[0]=CMD_READ;
-    cmd[1]=0;
-    cmd[2]=6;
+        uint8_t byte = (uint8_t)uart_getc(dev->uart);
+        if (received == 0 && byte != 0xC0)
+            continue;
+        response[received++] = byte;
+    }
 
+    bool success = received == sizeof(response);
+    if (success) {
+        for (size_t i = 0; i < sizeof(response); ++i)
+            config[i] = response[i];
+    }
 
-
-    uart_write_blocking(
-        dev->uart,
-        cmd,
-        3
-    );
-
-
-    sleep_ms(50);
-
-
-
-    uart_read_blocking(
-        dev->uart,
-        config,
-        6
-    );
-
-
+    e32_set_mode(dev, E32_MODE_NORMAL);
+    sleep_ms(200);
+    return success;
 }
 
 
@@ -350,36 +343,25 @@ void e32_write_config(
         E32_MODE_SLEEP
     );
 
-
-    /* The device's control block: opcode, the new address, transport settings,
-     * the channel, and a trailing reserved byte. */
-    uint8_t cfg[6];
+    sleep_ms(100);
 
 
-    cfg[0]=CMD_WRITE;
-
-
-    cfg[1]=address>>8;
-    cfg[2]=address&0xFF;
-
-
-    /* The rate the radio will use for the connector. This is the same
-     * setting e32_init() opened the Pico's UART at, spelled for the
-     * device's own field layout; see ebyte_e32.h. */
-    cfg[3] = E32_SPED_9600_8N1_2K4;
-
-
-    cfg[4]=channel;
-
-
-    cfg[5]=E32_OPTION_FIXED_TRANSMISSION;
-
-
+    /* Keep the radio connector at the same 9600 8N1 rate as uart_init(),
+     * and use fixed transmission because e32_send_fixed() supplies the
+     * destination and channel bytes expected by the mesh. */
+    const uint8_t cfg[6] = {
+        CMD_WRITE,
+        (uint8_t)(address >> 8),
+        (uint8_t)(address & 0xFFu),
+        0x1A,
+        channel,
+        E32_OPTION_FIXED_TRANSMISSION
+    };
 
     uart_write_blocking(
         dev->uart,
         cfg,
-        6
+        sizeof(cfg)
     );
 
 

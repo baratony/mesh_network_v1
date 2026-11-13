@@ -16,11 +16,12 @@
 #include <string.h>
 #include <limits.h>
 
-/* Set to 0 to disable byte-by-byte UART logging. Override at build time with
- * -DRADIO_DEBUG_RAW_BYTES=0 when printf overhead interferes with reception. */
-#ifndef RADIO_DEBUG_RAW_BYTES
-#define RADIO_DEBUG_RAW_BYTES 1
+/* Set to 1 to dump complete received headers/frames while debugging RX. */
+#ifndef RADIO_DEBUG_RX_BYTES
+#define RADIO_DEBUG_RX_BYTES 1
 #endif
+
+#define RADIO_RX_INTERBYTE_TIMEOUT_US 100000
 
 /* One reassembly buffer per E32 device. The program only ever has one radio
  * (`e32_t radio`), but keeping a table means the same code would work if a
@@ -32,11 +33,27 @@ typedef struct
     e32_t *dev;                            /* which radio this slot belongs to (NULL = free) */
     uint8_t buffer[RADIO_MAX_PACKET_SIZE]; /* raw bytes collected so far */
     uint16_t position;                     /* write cursor into buffer */
+    uint16_t header_size;                  /* header boundary; 0 until route is known */
     uint16_t expected_length;              /* where the current packet must end; 0 = unknown yet */
     bool active;                           /* we are inside a packet (past the START byte) */
+    absolute_time_t last_byte_at;          /* last byte time, for partial-frame recovery */
 } radio_rx_state_t;
 
 static radio_rx_state_t rx_states[RADIO_RX_STATE_SLOTS];
+
+#if RADIO_DEBUG_RX_BYTES
+static void radio_debug_print_bytes(const char *label,
+                                    const uint8_t *bytes,
+                                    uint16_t length)
+{
+    printf("[RADIO RX] %s (%u bytes):",
+           label,
+           (unsigned)length);
+    for (uint16_t i = 0; i < length; ++i)
+        printf(" %02X", (unsigned)bytes[i]);
+    printf("\n");
+}
+#endif
 
 /* --- Big-endian helpers ---------------------------------------------------
  * The wire format is big-endian everywhere. That is deliberate: it makes the
@@ -55,6 +72,15 @@ static void write_u16_be(uint8_t *buffer, uint16_t value)
 static uint16_t read_u16_be(const uint8_t *buffer)
 {
     return (uint16_t)(((uint16_t)buffer[0] << 8) | buffer[1]);
+}
+
+static uint16_t radio_packet_header_size(uint16_t path_length)
+{
+    if (path_length == 0 || path_length > RADIO_MAX_ROUTE_ADDRESSES)
+        return 0;
+
+    return RADIO_PACKET_FIXED_HEADER_SIZE +
+           (uint16_t)(path_length * RADIO_WIRE_ADDRESS_SIZE);
 }
 
 /* Write a 32-bit value (a global address, a length, an offset...) as 4 bytes. */
@@ -248,6 +274,7 @@ void radio_receive_reset(e32_t *dev)
         return;
 
     state->position = 0;
+    state->header_size = 0;
     state->expected_length = 0;
     state->active = false;
 }
@@ -409,8 +436,7 @@ uint16_t radio_packet_encode(radio_packet_t *packet,
 
     /* The header length is variable because the route list is variable.
      * Everything after the route is addressed backwards from header_size. */
-    uint16_t header_size = RADIO_PACKET_FIXED_HEADER_SIZE +
-                           (uint16_t)(packet->path_length * sizeof(uint32_t));
+    uint16_t header_size = radio_packet_header_size(packet->path_length);
     uint16_t total_length = header_size + RADIO_PACKET_CRC_SIZE +
                             packet->length;
 
@@ -425,7 +451,8 @@ uint16_t radio_packet_encode(radio_packet_t *packet,
 
     /* --- the route list: this is what makes multi-hop routing possible --- */
     for (uint8_t i = 0; i < packet->path_length; ++i)
-        write_u32_be(&buffer[2u + (i * sizeof(uint32_t))], packet->path[i]);
+        write_u32_be(&buffer[2u + (i * RADIO_WIRE_ADDRESS_SIZE)],
+                     packet->path[i]);
 
     /* --- the rest of the header, counted back from its end --- */
     write_u16_be(&buffer[header_size - 7], packet->command);
@@ -472,7 +499,7 @@ bool radio_packet_decode(const uint8_t *buffer,
 
     /* Smallest legal packet = fixed header + one route address + CRC. */
     if (buffer_length < RADIO_PACKET_FIXED_HEADER_SIZE +
-                       sizeof(uint32_t) + RADIO_PACKET_CRC_SIZE)
+                       RADIO_WIRE_ADDRESS_SIZE + RADIO_PACKET_CRC_SIZE)
         return false;
 
     /* Resync marker: without it we cannot trust any other offset. */
@@ -486,8 +513,7 @@ bool radio_packet_decode(const uint8_t *buffer,
     if (path_length > RADIO_MAX_ROUTE_ADDRESSES)
         return false;
 
-    uint16_t header_size = RADIO_PACKET_FIXED_HEADER_SIZE +
-                           (uint16_t)(path_length * sizeof(uint32_t));
+    uint16_t header_size = radio_packet_header_size(path_length);
     if (buffer_length < header_size + RADIO_PACKET_CRC_SIZE)
         return false;
 
@@ -524,7 +550,8 @@ bool radio_packet_decode(const uint8_t *buffer,
     /* Mirror of encode(): same offsets, read instead of written. */
     packet->path_length = (uint8_t)path_length;
     for (uint8_t i = 0; i < packet->path_length; ++i)
-        packet->path[i] = read_u32_be(&buffer[2u + (i * sizeof(uint32_t))]);
+        packet->path[i] =
+            read_u32_be(&buffer[2u + (i * RADIO_WIRE_ADDRESS_SIZE)]);
     packet->source = packet->path[0];
     packet->destination = packet->path[packet->path_length - 1];
     packet->command = read_u16_be(&buffer[header_size - 7]);
@@ -631,6 +658,15 @@ bool radio_send_packet(e32_t *dev,
 bool radio_receive_packet(e32_t *dev,
                           radio_packet_t *packet)
 {
+#if RADIO_DEBUG_RX_BYTES
+    static bool debug_banner_printed;
+    if (!debug_banner_printed)
+    {
+        printf("[RADIO] RX byte dump enabled.\n");
+        debug_banner_printed = true;
+    }
+#endif
+
     if (dev == NULL || packet == NULL)
         return false;
 
@@ -644,9 +680,20 @@ bool radio_receive_packet(e32_t *dev,
     while (uart_is_readable(dev->uart))
     {
         uint8_t byte = uart_getc(dev->uart);
-#if RADIO_DEBUG_RAW_BYTES
-        printf("[RADIO UART RX] %02X\n", (unsigned)byte);
-#endif
+
+        absolute_time_t now = get_absolute_time();
+        if (state->active &&
+            absolute_time_diff_us(state->last_byte_at, now) >
+                RADIO_RX_INTERBYTE_TIMEOUT_US)
+        {
+            printf("[RADIO RX] Timed out partial frame: collected=%u expected=%u.\n",
+                   (unsigned)state->position,
+                   (unsigned)state->expected_length);
+            state->position = 0;
+            state->header_size = 0;
+            state->expected_length = 0;
+            state->active = false;
+        }
 
         /* PHASE 1 - hunting for the start byte. Garbage between packets
          * (radio noise, a truncated tail) is simply skipped here. */
@@ -657,10 +704,14 @@ bool radio_receive_packet(e32_t *dev,
 
             state->active = true;
             state->position = 0;
+            state->header_size = 0;
             state->expected_length = 0;
+            state->last_byte_at = now;
             state->buffer[state->position++] = byte;
             continue;
         }
+
+        state->last_byte_at = now;
 
         /* Overflow guard: a packet longer than the buffer can never be valid,
          * so we throw the run away and re-seek. The current byte is re-tested
@@ -668,6 +719,7 @@ bool radio_receive_packet(e32_t *dev,
         if (state->position >= RADIO_MAX_PACKET_SIZE)
         {
             state->position = 0;
+            state->header_size = 0;
             state->expected_length = 0;
             state->active = false;
 
@@ -675,6 +727,8 @@ bool radio_receive_packet(e32_t *dev,
             if (byte == RADIO_PACKET_START)
             {
                 state->active = true;
+                state->header_size = 0;
+                state->expected_length = 0;
                 state->buffer[state->position++] = byte;
             }
 
@@ -692,28 +746,58 @@ bool radio_receive_packet(e32_t *dev,
             uint16_t path_length = (uint16_t)route_jumps + 1u;
             if (path_length > RADIO_MAX_ROUTE_ADDRESSES)
             {
+                printf("[RADIO RX] Rejected header: route jumps=%u.\n",
+                       (unsigned)route_jumps);
                 state->position = 0;
+                state->header_size = 0;
                 state->expected_length = 0;
                 state->active = false;
                 continue;
             }
 
-            state->expected_length = RADIO_PACKET_FIXED_HEADER_SIZE +
-                                     (uint16_t)(path_length * sizeof(uint32_t));
+            state->header_size = radio_packet_header_size(path_length);
+            state->expected_length = state->header_size;
         }
 
         /* PHASE 3 - the header is complete, so the payload length field at
          * header_size-2 is now readable. Set the final stop condition. */
-        if (state->expected_length != 0 &&
-            state->position == state->expected_length)
+        if (state->header_size != 0 &&
+            state->position == state->header_size)
         {
-            uint16_t header_size = state->expected_length;
+            uint8_t route_jumps = state->buffer[1];
+            uint16_t path_length = (uint16_t)route_jumps + 1u;
+            uint16_t header_size = state->header_size;
             uint16_t data_length = read_u16_be(
                 &state->buffer[header_size - 2]);
 
             if (data_length > RADIO_MAX_DATA)
             {
+#if RADIO_DEBUG_RX_BYTES
+                uint16_t calculated_header_size =
+                    radio_packet_header_size(path_length);
+                printf("[RADIO RX] Header-size check: collected=%u calculated=%u "
+                       "(fixed=%u + path=%u * address-width=%u).\n",
+                       (unsigned)header_size,
+                       (unsigned)calculated_header_size,
+                       (unsigned)RADIO_PACKET_FIXED_HEADER_SIZE,
+                       (unsigned)path_length,
+                       (unsigned)RADIO_WIRE_ADDRESS_SIZE);
+#endif
+                printf("[RADIO RX] Rejected header: payload length=%u, "
+                       "route jumps=%u, path length=%u, fixed header=%u, "
+                       "header size=%u, length field offset=%u.\n",
+                       (unsigned)data_length,
+                       (unsigned)route_jumps,
+                       (unsigned)path_length,
+                       (unsigned)RADIO_PACKET_FIXED_HEADER_SIZE,
+                       (unsigned)header_size,
+                       (unsigned)(header_size - 2u));
+#if RADIO_DEBUG_RX_BYTES
+                radio_debug_print_bytes("Header rejected", state->buffer,
+                                        state->position);
+#endif
                 state->position = 0;
+                state->header_size = 0;
                 state->expected_length = 0;
                 state->active = false;
                 continue;
@@ -721,6 +805,7 @@ bool radio_receive_packet(e32_t *dev,
 
             state->expected_length = header_size + RADIO_PACKET_CRC_SIZE +
                                      data_length;
+            state->header_size = 0;
         }
 
         /* PHASE 4 - the whole packet (header + payload + CRC) is in hand.
@@ -729,22 +814,52 @@ bool radio_receive_packet(e32_t *dev,
         if (state->expected_length > 0 &&
             state->position == state->expected_length)
         {
-            printf("[RADIO RX] %u bytes:",
-                   (unsigned)state->expected_length);
-            for (uint16_t i = 0; i < state->expected_length; ++i)
-                printf(" %02X", (unsigned)state->buffer[i]);
-            printf("\n");
+#if RADIO_DEBUG_RX_BYTES
+            radio_debug_print_bytes("Received frame", state->buffer,
+                                    state->expected_length);
+#endif
 
             bool valid = radio_packet_decode(state->buffer,
                                               state->expected_length,
                                               packet);
 
+            if (!valid)
+            {
+                uint16_t header_size = radio_packet_header_size(
+                    (uint16_t)state->buffer[1] + 1u);
+                uint16_t data_length = read_u16_be(
+                    &state->buffer[header_size - sizeof(uint16_t)]);
+                uint16_t received_crc = read_u16_be(
+                    &state->buffer[state->expected_length -
+                                   RADIO_PACKET_CRC_SIZE]);
+                uint16_t calculated_crc = radio_crc16(
+                    state->buffer,
+                    state->expected_length - RADIO_PACKET_CRC_SIZE);
+
+                printf("[RADIO RX] Rejected frame: %u bytes, declared payload "
+                       "%u, CRC received=%04X calculated=%04X.\n",
+                       (unsigned)state->expected_length,
+                       (unsigned)data_length,
+                       (unsigned)received_crc,
+                       (unsigned)calculated_crc);
+            }
+
             state->position = 0;
+            state->header_size = 0;
             state->expected_length = 0;
             state->active = false;
 
             if (valid)
+            {
+                printf("[RADIO RX] Accepted packet: source=%08lX destination=%08lX "
+                       "command=%04X sequence=%u payload=%u.\n",
+                       (unsigned long)packet->source,
+                       (unsigned long)packet->destination,
+                       (unsigned)packet->command,
+                       (unsigned)packet->sequence,
+                       (unsigned)packet->length);
                 return true;
+            }
         }
     }
 

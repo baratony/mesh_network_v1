@@ -1210,7 +1210,8 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
 
     radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
     uint8_t neighbor_count = 0;
-    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count) &&
+        neighbor_file_length != 0)
     {
         printf("No valid neighbors in local_neighbors.txt\n");
         return 0;
@@ -1246,6 +1247,21 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
      * from the wire, so a malformed packet is simply ignored. */
     uint16_t received_local_addresses[64];
     size_t received_count = 0;
+
+    /* The direct neighbours' addresses arrive in the PONGs and must be
+     * reserved even if their own neighbour ledgers are empty. */
+    for (uint8_t i = 0; i < neighbor_count; ++i)
+    {
+        uint16_t local_address = neighbors[i].local_address;
+        if (local_address != 0 &&
+            !radio_local_address_used(received_local_addresses,
+                                      received_count,
+                                      local_address))
+        {
+            received_local_addresses[received_count++] = local_address;
+        }
+    }
+
     absolute_time_t timeout =
         make_timeout_time_ms(RADIO_CONNECTION_RESPONSE_TIMEOUT_MS);
 
@@ -1284,10 +1300,9 @@ uint16_t Generate_Local_Adress(uint32_t global_address,
         sleep_ms(1);
     }
 
-    /* Phase 3 - choose. Start from a random value so that two nodes joining
-     * at the same moment do not both pick 1, then walk forward deterministically
-     * so the search always terminates. 0 is never used: it means 'unused'. */
-    uint16_t candidate = (uint16_t)(get_rand_32() % UINT16_MAX) + 1u;
+    /* Phase 3 - choose the first free address. Starting at 1 gives an
+     * isolated node address 1 and the next node address 2. 0 means unused. */
+    uint16_t candidate = 1;
     for (uint32_t attempts = 0; attempts < UINT16_MAX; ++attempts)
     {
         if (!radio_local_address_used(received_local_addresses,
@@ -3285,7 +3300,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     static uint8_t neighbor_count = 0;
 
     absolute_time_t timeout =
-        make_timeout_time_ms(5000);
+        make_timeout_time_ms(10000);
 
 
     /* Listen for PONG responses */
@@ -3299,6 +3314,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
         {
             if (response.command == RADIO_CMD_PONG)
             {
+                printf("[RADIO] Pong Recieved\n");
                 /* Only accept our own PING's replies: the destination must be
                  * us and the sequence must be the one we sent. Anything else
                  * belongs to another node's conversation. */
@@ -3306,7 +3322,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
                     response.sequence == 1)
                 {
                     printf(
-                        "PONG received from %08lX\n",
+                        "PONG accepted from %08lX\n",
                         (unsigned long)response.source
                     );
 
@@ -3338,11 +3354,11 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     }
 
 
-    /* No neighbors found */
+    /* No neighbors found. Still upload an empty ledger so the address
+     * allocator can distinguish a new, isolated node from a failed download. */
     if (neighbor_count == 0)
     {
         printf("No neighbors found\n");
-        return;
     }
 
 
@@ -3432,7 +3448,8 @@ void Ping_Response(uint32_t Global_Adress,
 
     radio_neighbor_t neighbors[RADIO_NEIGHBOR_COUNT_MAX];
     uint8_t neighbor_count = 0;
-    if (!radio_parse_neighbor_file(neighbors, &neighbor_count))
+    if (!radio_parse_neighbor_file(neighbors, &neighbor_count) &&
+        neighbor_file_length != 0)
     {
         printf("No valid neighbors in local_neighbors.txt\n");
         return;
