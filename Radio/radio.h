@@ -271,8 +271,11 @@ bool Handle_Radio_Packet(uint32_t global_address,
  * ------------------------------------------------------------------------- */
 
 /* Step 1: broadcast a PING and record every PONG as a physical neighbour,
- * writing the result to local_neighbors.txt. */
-void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp);
+ * writing the result to local_neighbors.txt. Returns false when nobody
+ * answered - an isolated node, which is not a join and must not leave a
+ * neighbour file behind, because "no file" is exactly what marks a node as
+ * not yet part of the mesh (see radio_is_new_node). */
+bool Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp);
 
 /* Receiving side of the PING: answer with our own 16-bit radio address so
  * the pinger can add us to its neighbour file. */

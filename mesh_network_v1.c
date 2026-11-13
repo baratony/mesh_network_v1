@@ -54,6 +54,12 @@
 #define NODE_KEY_FILE       "node_rsa_key.txt"
 #define NODE_KEY_FILE_MAX   1400
 
+/* How many times the whole join sequence is tried when the radio hears
+ * nobody. A node with no neighbours in range has not joined the mesh, and
+ * nothing in the program can connect it later, so the only useful answer is
+ * to try again a few times and then say so. */
+#define JOIN_MESH_ATTEMPTS 5
+
 /* ---------------------------------------------------------------------------
  * 1b. The numbers the home page shows
  *
@@ -805,8 +811,16 @@ static bool join_mesh_as_new_node(void)
 
     network_lock_enter();
 
-    /* 1. Discover the nodes in radio range and create local_neighbors.txt. */
-    (node_global_address, &radio, &node_ftp);
+    /* 1. Discover the nodes in radio range and create local_neighbors.txt.
+     *      An isolated node has not joined, and saying otherwise is what
+     *      made the retry loop above run only once: with nothing found there
+     *      is no address to claim and nobody to announce, so stop here. */
+    if (!Find_Neighbors(node_global_address, &radio, &node_ftp))
+    {
+        printf("[NODE] No neighbours in radio range, not joining\n");
+        network_lock_exit();
+        return false;
+    }
 
     /* 2. Ask the neighbours for the addresses they already use and take a free
        one for ourselves. */
@@ -1689,18 +1703,30 @@ void second_core_code(void)
     if (new_node)
     {
         printf("[CORE 1] New Node Detected! Starting intilization process.\n");
-        bool joined = join_mesh_as_new_node();
+        /* JOIN_MESH_ATTEMPTS in total, not one plus five more: an
+         * isolated node returns false from join_mesh_as_new_node() now that
+         * Find_Neighbors reports what it heard, so the loop really does run
+         * again. The sleep is only between attempts, never after the last. */
+        bool joined = false;
 
-        for (int i = 0; i < 5 && !joined; i++)
+        for (int attempt = 1; attempt <= JOIN_MESH_ATTEMPTS && !joined; ++attempt)
         {
-            printf("[CORE 1] Attempting network join again.\n");
-            sleep_ms(2000);
+            if (attempt > 1)
+            {
+                printf("[CORE 1] Attempting network join again (%d/%d).\n",
+                       attempt, JOIN_MESH_ATTEMPTS);
+                sleep_ms(2000);
+            }
+
             joined = join_mesh_as_new_node();
         }
 
         if (!joined)
         {
-            printf("[CORE 1] Could not join the mesh after multiple attempts.\n");
+            printf("[CORE 1] No neighbours found after %d attempts. "
+                   "This node is isolated; it will not join the mesh.\n",
+                   JOIN_MESH_ATTEMPTS);
+            return;
         }
     }
     else

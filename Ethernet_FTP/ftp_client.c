@@ -106,20 +106,47 @@ static int ftp_read_reply(int sock, char *out, int maxlen, uint8_t debug)
          * works on CRLF and bare-LF servers alike. */
         char line[256];
         int len = 0;
+        int line_complete = 0;
+
         while (len < (int)sizeof(line) - 1) {
+            if (time_reached(deadline)) {
+                if (debug) {
+                    printf("[FTP] reply timed out\n");
+                }
+                return -2;
+            }
+
             uint8_t ch = 0;
             int n = recv(sock, &ch, 1);
+
             if (n <= 0) {
-                return -1;
+                /* No byte this call. The socket API reports the same value
+                 * both when nothing has arrived yet and when the peer has
+                 * gone quiet in the middle of a reply, and the only way to
+                 * tell those apart is to keep going until the deadline.
+                 * Giving up here is what desynchronised the control channel:
+                 * the reply we were waiting for stayed in the buffer, so
+                 * every later command read that stale line instead of its
+                 * own ('RETR rejected with code -1', then a PASV that finds
+                 * '226 Transfer complete.'). */
+                sleep_ms(5);
+                continue;
             }
 
             if (ch == '\n') {
+                line_complete = 1;
                 break;
             }
 
             if (ch != '\r') {
                 line[len++] = (char)ch;
             }
+        }
+
+        /* A run of bytes with no newline in it is not a reply: drop it and
+         * look for the next one, rather than parsing half a line. */
+        if (!line_complete) {
+            continue;
         }
 
         line[len] = 0;

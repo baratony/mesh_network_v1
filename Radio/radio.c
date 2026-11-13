@@ -1074,6 +1074,35 @@ bool radio_download_neighbor_file(ftp_client_t *ftp)
 }
 
 
+/* The same download, but reading a missing file as "nothing recorded yet"
+ * rather than as a failure. Only the two callers that END BY WRITING the
+ * list may use it - Ping_Response and Respond_To_Local_Address - because for
+ * them an absent file is not a broken connection, it is an empty neighbour
+ * list, and the list they write back is the correction. This is the same
+ * reading radio_append_text_line() already uses for the message ledgers, and
+ * it is what lets two nodes that have never met, and have no file either,
+ * discover each in both directions. */
+static bool radio_download_neighbor_file_or_empty(ftp_client_t *ftp)
+{
+    neighbor_file_length = 0;
+    neighbor_file_overflow = false;
+
+    if (ftp == NULL)
+        return false;
+
+    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb))
+    {
+        /* Keep the buffer empty and report success: there is nothing to
+         * have lost. */
+        neighbor_file_length = 0;
+        neighbor_file_overflow = false;
+        return true;
+    }
+
+    return !neighbor_file_overflow;
+}
+
+
 /*
  * A node is brand new when it has no neighbour list on the FTP server:
  * the file is missing, empty, or contains no valid "GLOBAL,LOCAL" entry.
@@ -3260,7 +3289,7 @@ bool Handle_Radio_Packet(uint32_t global_address,
 /* Step 1: broadcast a PING to every radio in range and collect the PONGs.
  * A PONG carries the responder's 16-bit address, which is the only way a
  * node can ever learn how to address a neighbour it has never met. */
-void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
+bool Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
 
     radio_packet_t ping_packet;
 
@@ -3295,9 +3324,15 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
         uint16_t local_address;
     } neighbor_t;
 
+    /* static, not automatic: eight of these plus the receive buffers would
+     * not fit the stack comfortably. That is exactly why the count has to be
+     * cleared here - a second call (the join sequence is retried when a node
+     * is isolated) would otherwise resume from the previous attempt's total
+     * and re-upload neighbours that were never heard again. */
     static neighbor_t neighbors[8];
 
-    static uint8_t neighbor_count = 0;
+    static uint8_t neighbor_count;
+    neighbor_count = 0;
 
     absolute_time_t timeout =
         make_timeout_time_ms(10000);
@@ -3354,11 +3389,14 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     }
 
 
-    /* No neighbors found. Still upload an empty ledger so the address
-     * allocator can distinguish a new, isolated node from a failed download. */
+    /* Nobody answered. Leave the ledger alone: an empty local_neighbors.txt
+     * would read back as "this node has joined and has zero neighbours",
+     * which is not true - the node is isolated and must stay a new node so
+     * the join sequence runs again. The caller reports and retries. */
     if (neighbor_count == 0)
     {
         printf("No neighbors found\n");
+        return false;
     }
 
 
@@ -3396,7 +3434,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
         if (len < 0)
         {
             printf("Failed to format neighbor address\n");
-            return;
+            return false;
         }
 
         offset += len;
@@ -3404,7 +3442,7 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
         if (offset >= sizeof(neighbor_text))
         {
             printf("Neighbor file buffer full\n");
-            return;
+            return false;
         }
     }
 
@@ -3418,16 +3456,21 @@ void Find_Neighbors(uint32_t Global_Adress, e32_t *radio, ftp_client_t *ftp) {
     {
         printf("FTP upload failed\n");
         ftp_disconnect(ftp);
-        return;
+        return false;
     }
 
     printf("FTP upload ok\n");
-};
+    return true;
+}
 
 
-/* Receiving side of the PING, called from main()'s dispatcher. Answering is
- * the only way a node that has already joined can be discovered by a newcomer,
- * so this keeps the physical graph symmetric over time. */
+/* Receiving side of the PING. Answering is how a node gets discovered at
+ * all, so this is the half of the graph that keeps it symmetric: the node
+ * that was pinged learns the pinger's radio address from the
+ * RADIO_CMD_SEND_LOCAL_ADRESS that follows, and records it in its own file
+ * (see Respond_To_Local_Address). A node with no neighbour file answers too,
+ * with an empty list - it is isolated, not broken, and it is about to gain
+ * its first neighbour. */
 void Ping_Response(uint32_t Global_Adress,
                    uint16_t Local_Adress,
                    e32_t *radio,
@@ -3437,12 +3480,9 @@ void Ping_Response(uint32_t Global_Adress,
     if (radio == NULL || ftp == NULL)
         return;
 
-    neighbor_file_length = 0;
-    neighbor_file_overflow = false;
-    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
-        neighbor_file_overflow)
+    if (!radio_download_neighbor_file_or_empty(ftp))
     {
-        printf("FTP local_neighbors.txt download failed\n");
+        printf("local_neighbors.txt is unreadable; PONG not sent\n");
         return;
     }
 
@@ -3621,12 +3661,9 @@ bool Respond_To_Local_Address(uint32_t global_address,
     uint16_t local_address = (uint16_t)(((uint16_t)request->data[0] << 8) |
                                         request->data[1]);
 
-    neighbor_file_length = 0;
-    neighbor_file_overflow = false;
-    if (!ftp_download(ftp, "local_neighbors.txt", radio_neighbor_file_cb) ||
-        neighbor_file_overflow)
+    if (!radio_download_neighbor_file_or_empty(ftp))
     {
-        printf("FTP local_neighbors.txt download failed\n");
+        printf("local_neighbors.txt is unreadable; local address not stored\n");
         return false;
     }
 
